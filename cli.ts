@@ -3,6 +3,7 @@
  */
 
 import type { Command } from "commander";
+import { readFileSync } from "node:fs";
 import { loadLanceDB, type MemoryEntry, type MemoryStore } from "./src/store.js";
 import type { MemoryRetriever } from "./src/retriever.js";
 import type { MemoryScopeManager } from "./src/scopes.js";
@@ -24,11 +25,28 @@ interface CLIContext {
 // Utility Functions
 // ============================================================================
 
+function getPluginVersion(): string {
+  try {
+    const pkgUrl = new URL("./package.json", import.meta.url);
+    const pkg = JSON.parse(readFileSync(pkgUrl, "utf8")) as { version?: string };
+    return pkg.version || "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+function clampInt(value: number, min: number, max: number): number {
+  const n = Number.isFinite(value) ? value : min;
+  return Math.max(min, Math.min(max, Math.trunc(n)));
+}
+
 function formatMemory(memory: any, index?: number): string {
   const prefix = index !== undefined ? `${index + 1}. ` : "";
+  const id = memory?.id ? String(memory.id) : "unknown";
   const date = new Date(memory.timestamp || memory.createdAt || Date.now()).toISOString().split('T')[0];
-  const text = memory.text.slice(0, 100) + (memory.text.length > 100 ? "..." : "");
-  return `${prefix}[${memory.category}:${memory.scope}] ${text} (${date})`;
+  const fullText = String(memory.text || "");
+  const text = fullText.slice(0, 100) + (fullText.length > 100 ? "..." : "");
+  return `${prefix}[${id}] [${memory.category}:${memory.scope}] ${text} (${date})`;
 }
 
 function formatJson(obj: any): string {
@@ -42,7 +60,15 @@ function formatJson(obj: any): string {
 export function registerMemoryCLI(program: Command, context: CLIContext): void {
   const memory = program
     .command("memory-pro")
-    .description("Enhanced memory management commands");
+    .description("Enhanced memory management commands (LanceDB Pro)");
+
+  // Version
+  memory
+    .command("version")
+    .description("Print plugin version")
+    .action(() => {
+      console.log(getPluginVersion());
+    });
 
   // List memories
   memory
@@ -126,7 +152,7 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
               if (result.sources.reranked) sources.push("reranked");
 
               console.log(
-                `${i + 1}. [${result.entry.category}:${result.entry.scope}] ${result.entry.text} ` +
+                `${i + 1}. [${result.entry.id}] [${result.entry.category}:${result.entry.scope}] ${result.entry.text} ` +
                 `(${(result.score * 100).toFixed(0)}%, ${sources.join('+')})`
               );
             });
@@ -490,8 +516,8 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
               vector,
               category: (row.category as any) || "other",
               scope: (row.scope as string | undefined) || "global",
-              importance: typeof row.importance === "number" ? row.importance : 0.7,
-              timestamp: typeof row.timestamp === "number" ? row.timestamp : Date.now(),
+              importance: (row.importance != null) ? Number(row.importance) : 0.7,
+              timestamp: (row.timestamp != null) ? Number(row.timestamp) : Date.now(),
               metadata: typeof row.metadata === "string" ? row.metadata : "{}",
             };
 

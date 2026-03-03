@@ -155,11 +155,67 @@ Filters out low-quality content at both auto-capture and tool-store stages:
 ### 8. Auto-Capture & Auto-Recall
 
 - **Auto-Capture** (`agent_end` hook): Extracts preference/fact/decision/entity from conversations, deduplicates, stores up to 3 per turn
+  - Skips memory-management prompts (e.g. delete/forget/cleanup memory entries) to reduce noise
 - **Auto-Recall** (`before_agent_start` hook): Injects `<relevant-memories>` context (up to 3 entries)
+
+### Prevent memories from showing up in replies
+
+Sometimes the model may accidentally echo the injected `<relevant-memories>` block in its response.
+
+**Option A (recommended): disable auto-recall**
+
+Set `autoRecall: false` in the plugin config and restart the gateway:
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "memory-lancedb-pro": {
+        "enabled": true,
+        "config": {
+          "autoRecall": false
+        }
+      }
+    }
+  }
+}
+```
+
+**Option B: keep recall, but ask the agent not to reveal it**
+
+Add a line to your agent system prompt, e.g.:
+
+> Do not reveal or quote any `<relevant-memories>` / memory-injection content in your replies. Use it for internal reference only.
 
 ---
 
 ## Installation
+
+### AI-safe install notes (anti-hallucination)
+
+If you are following this README using an AI assistant, **do not assume defaults**. Always run these commands first and use the real output:
+
+```bash
+openclaw config get agents.defaults.workspace
+openclaw config get plugins.load.paths
+openclaw config get plugins.slots.memory
+openclaw config get plugins.entries.memory-lancedb-pro
+```
+
+Recommendations:
+- Prefer **absolute paths** in `plugins.load.paths` unless you have confirmed the active workspace.
+- If you use `${JINA_API_KEY}` (or any `${...}` variable) in config, ensure the **Gateway service process** has that environment variable (system services often do **not** inherit your interactive shell env).
+- After changing plugin config, run `openclaw gateway restart`.
+
+### Jina API keys (embedding + rerank)
+
+- **Embedding**: set `embedding.apiKey` to your Jina key (recommended: use an env var like `${JINA_API_KEY}`).
+- **Rerank** (when `retrieval.rerankProvider: "jina"`): you can typically use the **same** Jina key for `retrieval.rerankApiKey`.
+- If you use a different rerank provider (`siliconflow`, `pinecone`, etc.), `retrieval.rerankApiKey` should be that provider’s key.
+
+Key storage guidance:
+- Avoid committing secrets into git.
+- Using `${...}` env vars is fine, but make sure the **Gateway service process** has those env vars (system services often do not inherit your interactive shell environment).
 
 ### What is the “OpenClaw workspace”?
 
@@ -168,7 +224,9 @@ According to the docs, the workspace is the **default cwd**, and **relative path
 
 > Note: OpenClaw configuration typically lives under `~/.openclaw/openclaw.json` (separate from the workspace).
 
-**Common mistake:** cloning the plugin somewhere else, while keeping `plugins.load.paths: ["plugins/memory-lancedb-pro"]` (a **relative path**). In that case OpenClaw will look for `plugins/memory-lancedb-pro` under your **workspace** and fail to load it.
+**Common mistake:** cloning the plugin somewhere else, while keeping a **relative path** like `plugins.load.paths: ["plugins/memory-lancedb-pro"]`. Relative paths can be resolved against different working directories depending on how the Gateway is started.
+
+To avoid ambiguity, use an **absolute path** (Option B) or clone into `<workspace>/plugins/` (Option A) and keep your config consistent.
 
 ### Option A (recommended): clone into `plugins/` under your workspace
 
@@ -278,15 +336,15 @@ openclaw config get plugins.slots.memory
   },
   "dbPath": "~/.openclaw/memory/lancedb-pro",
   "autoCapture": true,
-  "autoRecall": true,
+  "autoRecall": false,
   "retrieval": {
     "mode": "hybrid",
     "vectorWeight": 0.7,
     "bm25Weight": 0.3,
     "minScore": 0.3,
     "rerank": "cross-encoder",
-    "rerankApiKey": "jina_xxx",
-    "rerankModel": "jina-reranker-v2-base-multilingual",
+    "rerankApiKey": "${JINA_API_KEY}",
+    "rerankModel": "jina-reranker-v3",
     "rerankEndpoint": "https://api.jina.ai/v1/rerank",
     "rerankProvider": "jina",
     "candidatePoolSize": 20,
@@ -326,7 +384,7 @@ This plugin works with **any OpenAI-compatible embedding API**:
 | **Jina** (recommended) | `jina-embeddings-v5-text-small` | `https://api.jina.ai/v1` | 1024 |
 | **OpenAI** | `text-embedding-3-small` | `https://api.openai.com/v1` | 1536 |
 | **Google Gemini** | `gemini-embedding-001` | `https://generativelanguage.googleapis.com/v1beta/openai/` | 3072 |
-| **Ollama** (local) | `nomic-embed-text` | `http://localhost:11434/v1` | 768 |
+| **Ollama** (local) | `nomic-embed-text` | `http://localhost:11434/v1` | _provider-specific_ (set `embedding.dimensions` to match your Ollama model output) |
 
 ### Rerank Providers
 
@@ -334,9 +392,14 @@ Cross-encoder reranking supports multiple providers via `rerankProvider`:
 
 | Provider | `rerankProvider` | Endpoint | Example Model |
 |----------|-----------------|----------|---------------|
-| **Jina** (default) | `jina` | `https://api.jina.ai/v1/rerank` | `jina-reranker-v2-base-multilingual` |
+| **Jina** (default) | `jina` | `https://api.jina.ai/v1/rerank` | `jina-reranker-v3` |
 | **SiliconFlow** (free tier available) | `siliconflow` | `https://api.siliconflow.com/v1/rerank` | `BAAI/bge-reranker-v2-m3`, `Qwen/Qwen3-Reranker-8B` |
+| **Voyage AI** | `voyage` | `https://api.voyageai.com/v1/rerank` | `rerank-2.5` |
 | **Pinecone** | `pinecone` | `https://api.pinecone.io/rerank` | `bge-reranker-v2-m3` |
+
+Notes:
+- `voyage` sends `{ model, query, documents }` without `top_n`.
+- Voyage responses are parsed from `data[].relevance_score`.
 
 <details>
 <summary><strong>SiliconFlow Example</strong></summary>
@@ -349,6 +412,23 @@ Cross-encoder reranking supports multiple providers via `rerankProvider`:
     "rerankEndpoint": "https://api.siliconflow.com/v1/rerank",
     "rerankApiKey": "sk-xxx",
     "rerankModel": "BAAI/bge-reranker-v2-m3"
+  }
+}
+```
+
+</details>
+
+<details>
+<summary><strong>Voyage Example</strong></summary>
+
+```json
+{
+  "retrieval": {
+    "rerank": "cross-encoder",
+    "rerankProvider": "voyage",
+    "rerankEndpoint": "https://api.voyageai.com/v1/rerank",
+    "rerankApiKey": "${VOYAGE_API_KEY}",
+    "rerankModel": "rerank-2.5"
   }
 }
 ```
@@ -374,10 +454,167 @@ Cross-encoder reranking supports multiple providers via `rerankProvider`:
 
 ---
 
+## Optional: JSONL Session Distillation (Auto-memories from chat logs)
+
+OpenClaw already persists **full session transcripts** as JSONL files:
+
+- `~/.openclaw/agents/<agentId>/sessions/*.jsonl`
+
+This plugin focuses on **high-quality long-term memory**. If you dump raw transcripts into LanceDB, retrieval quality quickly degrades.
+
+Instead, **recommended (2026-02+)** is a **non-blocking `/new` pipeline**:
+
+- Trigger: `command:new` (you type `/new`)
+- Hook: enqueue a tiny JSON task file (fast; no LLM calls inside the hook)
+- Worker: a user-level systemd service watches the inbox and runs **Gemini Map-Reduce** on the session JSONL transcript
+- Store: writes **0–20** high-signal, atomic lessons into LanceDB Pro via `openclaw memory-pro import`
+- Keywords: each memory includes `Keywords (zh)` with a simple taxonomy (Entity + Action + Symptom). Entity keywords must be copied verbatim from the transcript (no hallucinated project names).
+- Notify: optional Telegram/Discord notification (even if 0 lessons)
+
+See the self-contained example files in:
+- `examples/new-session-distill/`
+
+---
+
+Legacy option: an **hourly distiller** cron that:
+
+1) Incrementally reads only the **newly appended tail** of each session JSONL (byte-offset cursor)
+2) Filters noise (tool output, injected `<relevant-memories>`, logs, boilerplate)
+3) Uses a dedicated agent to **distill** reusable lessons / rules / preferences into short atomic memories
+4) Stores them via `memory_store` into the right **scope** (`global` or `agent:<agentId>`)
+
+### What you get
+
+- ✅ Fully automatic (cron)
+- ✅ Multi-agent support (main + bots)
+- ✅ No re-reading: cursor ensures the next run only processes new lines
+- ✅ Memory hygiene: quality gate + dedupe + per-run caps
+
+### Script
+
+This repo includes the extractor script:
+
+- `scripts/jsonl_distill.py`
+
+It produces a small **batch JSON** file under:
+
+- `~/.openclaw/state/jsonl-distill/batches/`
+
+and keeps a cursor here:
+
+- `~/.openclaw/state/jsonl-distill/cursor.json`
+
+The script is **safe**: it never modifies session logs.
+
+By default it skips historical reset snapshots (`*.reset.*`) and excludes the distiller agent itself (`memory-distiller`) to prevent self-ingestion loops.
+
+### Optional: restrict distillation sources (allowlist)
+
+By default, the extractor scans **all agents** (except `memory-distiller`).
+
+If you want higher signal (e.g., only distill from your main assistant + coding bot), set:
+
+```bash
+export OPENCLAW_JSONL_DISTILL_ALLOWED_AGENT_IDS="main,code-agent"
+```
+
+- Unset / empty / `*` / `all` → allow all agents (default)
+- Comma-separated list → only those agents are scanned
+
+### Recommended setup (dedicated distiller agent)
+
+#### 1) Create a dedicated agent
+
+```bash
+openclaw agents add memory-distiller \
+  --non-interactive \
+  --workspace ~/.openclaw/workspace-memory-distiller \
+  --model openai-codex/gpt-5.2
+```
+
+#### 2) Initialize cursor (Mode A: start from now)
+
+This marks all existing JSONL files as "already read" by setting offsets to EOF.
+
+```bash
+# Set PLUGIN_DIR to where this plugin is installed.
+# - If you cloned into your OpenClaw workspace (recommended):
+#   PLUGIN_DIR="$HOME/.openclaw/workspace/plugins/memory-lancedb-pro"
+# - Otherwise, check: `openclaw plugins info memory-lancedb-pro` and locate the directory.
+PLUGIN_DIR="/path/to/memory-lancedb-pro"
+
+python3 "$PLUGIN_DIR/scripts/jsonl_distill.py" init
+```
+
+#### 3) Create an hourly cron job (Asia/Shanghai)
+
+Tip: start the message with `run ...` so `memory-lancedb-pro`'s adaptive retrieval will skip auto-recall injection (saves tokens).
+
+```bash
+# IMPORTANT: replace <PLUGIN_DIR> in the template below with your actual plugin path.
+MSG=$(cat <<'EOF'
+run jsonl memory distill
+
+Goal: distill NEW chat content from OpenClaw session JSONL files into high-quality LanceDB memories using memory_store.
+
+Hard rules:
+- Incremental only: call the extractor script; do NOT scan full history.
+- Store only reusable memories; skip routine chatter.
+- English memory text + final line: Keywords (zh): ...
+- < 500 chars, atomic.
+- <= 3 memories per agent per run; <= 3 global per run.
+- Scope: global for broadly reusable; otherwise agent:<agentId>.
+
+Workflow:
+1) exec: python3 <PLUGIN_DIR>/scripts/jsonl_distill.py run
+2) If noop: stop.
+3) Read batchFile (created/pending)
+4) memory_store(...) for selected memories
+5) exec: python3 <PLUGIN_DIR>/scripts/jsonl_distill.py commit --batch-file <batchFile>
+EOF
+)
+
+openclaw cron add \
+  --agent memory-distiller \
+  --name "jsonl-memory-distill (hourly)" \
+  --cron "0 * * * *" \
+  --tz "Asia/Shanghai" \
+  --session isolated \
+  --wake now \
+  --timeout-seconds 420 \
+  --stagger 5m \
+  --no-deliver \
+  --message "$MSG"
+```
+
+#### 4) Debug run
+
+```bash
+openclaw cron run <jobId> --expect-final --timeout 180000
+openclaw cron runs --id <jobId> --limit 5
+```
+
+### Scope strategy (recommended)
+
+When distilling **all agents**, always set `scope` explicitly when calling `memory_store`:
+
+- Broadly reusable → `scope=global`
+- Agent-specific → `scope=agent:<agentId>`
+
+This prevents cross-bot memory pollution.
+
+### Rollback
+
+- Disable/remove cron job: `openclaw cron disable <jobId>` / `openclaw cron rm <jobId>`
+- Delete agent: `openclaw agents delete memory-distiller`
+- Remove cursor state: `rm -rf ~/.openclaw/state/jsonl-distill/`
+
+---
+
 ## CLI Commands
 
 ```bash
-# List memories
+# List memories (output includes the memory id)
 openclaw memory-pro list [--scope global] [--category fact] [--limit 20] [--json]
 
 # Search memories
@@ -387,6 +624,7 @@ openclaw memory-pro search "query" [--scope global] [--limit 10] [--json]
 openclaw memory-pro stats [--scope global] [--json]
 
 # Delete a memory by ID (supports 8+ char prefix)
+# Tip: copy the id shown by `memory-pro list` / `memory-pro search` (or use --json for full output)
 openclaw memory-pro delete <id>
 
 # Bulk delete with filters
@@ -462,6 +700,61 @@ LanceDB table `memories`:
 
 ---
 
+## Troubleshooting
+
+### "Cannot mix BigInt and other types" (LanceDB / Apache Arrow)
+
+On LanceDB 0.26+ (via Apache Arrow), some numeric columns may be returned as `BigInt` at runtime (commonly: `timestamp`, `importance`, `_distance`, `_score`). If you see errors like:
+
+- `TypeError: Cannot mix BigInt and other types, use explicit conversions`
+
+upgrade to **memory-lancedb-pro >= 1.0.14**. This plugin now coerces these values using `Number(...)` before doing arithmetic (for example, when computing scores or sorting by timestamp).
+
+## Iron Rules for AI Agents (铁律)
+
+> **For OpenClaw users**: copy the code block below into your `AGENTS.md` so your agent enforces these rules automatically.
+
+```markdown
+## Rule 1 — 双层记忆存储（铁律）
+
+Every pitfall/lesson learned → IMMEDIATELY store TWO memories to LanceDB before moving on:
+
+- **Technical layer**: Pitfall: [symptom]. Cause: [root cause]. Fix: [solution]. Prevention: [how to avoid]
+  (category: fact, importance ≥ 0.8)
+- **Principle layer**: Decision principle ([tag]): [behavioral rule]. Trigger: [when it applies]. Action: [what to do]
+  (category: decision, importance ≥ 0.85)
+- After each store, immediately `memory_recall` with anchor keywords to verify retrieval.
+  If not found, rewrite and re-store.
+- Missing either layer = incomplete.
+  Do NOT proceed to next topic until both are stored and verified.
+- Also update relevant SKILL.md files to prevent recurrence.
+
+## Rule 2 — LanceDB 卫生
+
+Entries must be short and atomic (< 500 chars). Never store raw conversation summaries, large blobs, or duplicates.
+Prefer structured format with keywords for retrieval.
+
+## Rule 3 — Recall before retry
+
+On ANY tool failure, repeated error, or unexpected behavior, ALWAYS `memory_recall` with relevant keywords
+(error message, tool name, symptom) BEFORE retrying. LanceDB likely already has the fix.
+Blind retries waste time and repeat known mistakes.
+
+## Rule 4 — 编辑前确认目标代码库
+
+When working on memory plugins, confirm you are editing the intended package
+(e.g., `memory-lancedb-pro` vs built-in `memory-lancedb`) before making changes;
+use `memory_recall` + filesystem search to avoid patching the wrong repo.
+
+## Rule 5 — 插件代码变更必须清 jiti 缓存（MANDATORY）
+
+After modifying ANY `.ts` file under `plugins/`, MUST run `rm -rf /tmp/jiti/` BEFORE `openclaw gateway restart`.
+jiti caches compiled TS; restart alone loads STALE code. This has caused silent bugs multiple times.
+Config-only changes do NOT need cache clearing.
+```
+
+---
+
 ## Dependencies
 
 | Package | Purpose |
@@ -471,6 +764,44 @@ LanceDB table `memories`:
 | `@sinclair/typebox` 0.34.48 | JSON Schema type definitions (tool parameters) |
 
 ---
+
+## Contributors
+
+Top contributors (from GitHub’s contributors list, sorted by commit contributions; bots excluded):
+
+<p>
+<a href="https://github.com/win4r"><img src="https://avatars.githubusercontent.com/u/42172631?v=4" width="48" height="48" alt="@win4r" /></a>
+<a href="https://github.com/kctony"><img src="https://avatars.githubusercontent.com/u/1731141?v=4" width="48" height="48" alt="@kctony" /></a>
+<a href="https://github.com/Akatsuki-Ryu"><img src="https://avatars.githubusercontent.com/u/8062209?v=4" width="48" height="48" alt="@Akatsuki-Ryu" /></a>
+<a href="https://github.com/JasonSuz"><img src="https://avatars.githubusercontent.com/u/612256?v=4" width="48" height="48" alt="@JasonSuz" /></a>
+<a href="https://github.com/Minidoracat"><img src="https://avatars.githubusercontent.com/u/11269639?v=4" width="48" height="48" alt="@Minidoracat" /></a>
+<a href="https://github.com/furedericca-lab"><img src="https://avatars.githubusercontent.com/u/263020793?v=4" width="48" height="48" alt="@furedericca-lab" /></a>
+<a href="https://github.com/joe2643"><img src="https://avatars.githubusercontent.com/u/19421931?v=4" width="48" height="48" alt="@joe2643" /></a>
+<a href="https://github.com/AliceLJY"><img src="https://avatars.githubusercontent.com/u/136287420?v=4" width="48" height="48" alt="@AliceLJY" /></a>
+<a href="https://github.com/chenjiyong"><img src="https://avatars.githubusercontent.com/u/8199522?v=4" width="48" height="48" alt="@chenjiyong" /></a>
+</p>
+
+- [@win4r](https://github.com/win4r) (3 commits)
+- [@kctony](https://github.com/kctony) (2 commits)
+- [@Akatsuki-Ryu](https://github.com/Akatsuki-Ryu) (1 commit)
+- [@AliceLJY](https://github.com/AliceLJY) (1 commit)
+- [@chenjiyong](https://github.com/chenjiyong) (1 commit)
+- [@JasonSuz](https://github.com/JasonSuz) (1 commit)
+- [@Minidoracat](https://github.com/Minidoracat) (1 commit)
+- [@furedericca-lab](https://github.com/furedericca-lab) (1 commit)
+- [@joe2643](https://github.com/joe2643) (1 commit)
+
+Full list: https://github.com/win4r/memory-lancedb-pro/graphs/contributors
+
+## ⭐ Star History
+
+<a href="https://star-history.com/#win4r/memory-lancedb-pro&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=win4r/memory-lancedb-pro&type=Date&theme=dark&transparent=true" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=win4r/memory-lancedb-pro&type=Date&transparent=true" />
+    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=win4r/memory-lancedb-pro&type=Date&transparent=true" />
+  </picture>
+</a>
 
 ## License
 

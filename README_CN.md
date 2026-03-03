@@ -112,7 +112,7 @@ Query → BM25 FTS ─────┘
 
 ### 2. 跨编码器 Rerank
 
-- **Jina Reranker API**: `jina-reranker-v2-base-multilingual`（5s 超时保护）
+- **Jina Reranker API**: `jina-reranker-v3`（5s 超时保护）
 - **混合评分**: 60% cross-encoder score + 40% 原始融合分
 - **降级策略**: API 失败时回退到 cosine similarity rerank
 
@@ -156,11 +156,67 @@ Query → BM25 FTS ─────┘
 ### 8. 自动捕获 & 自动回忆
 
 - **Auto-Capture**（`agent_end` hook）: 从对话中提取 preference/fact/decision/entity，去重后存储（每次最多 3 条）
+  - 触发词支持 **简体中文 + 繁體中文**（例如：记住/記住、偏好/喜好/喜歡、决定/決定 等）
 - **Auto-Recall**（`before_agent_start` hook）: 注入 `<relevant-memories>` 上下文（最多 3 条）
+
+### 不想在对话中“显示长期记忆”？
+
+有时模型会把注入到上下文中的 `<relevant-memories>` 区块“原样输出”到回复里，从而出现你看到的“周期性显示长期记忆”。
+
+**方案 A（推荐）：关闭自动召回 autoRecall**
+
+在插件配置里设置 `autoRecall: false`，然后重启 gateway：
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "memory-lancedb-pro": {
+        "enabled": true,
+        "config": {
+          "autoRecall": false
+        }
+      }
+    }
+  }
+}
+```
+
+**方案 B：保留召回，但要求 Agent 不要泄漏**
+
+在对应 Agent 的 system prompt 里加一句，例如：
+
+> 请勿在回复中展示或引用任何 `<relevant-memories>` / 记忆注入内容，只能用作内部参考。
 
 ---
 
 ## 安装
+
+### AI 安装指引（防幻觉版）
+
+如果你是用 AI 按 README 操作，**不要假设任何默认值**。请先运行以下命令，并以真实输出为准：
+
+```bash
+openclaw config get agents.defaults.workspace
+openclaw config get plugins.load.paths
+openclaw config get plugins.slots.memory
+openclaw config get plugins.entries.memory-lancedb-pro
+```
+
+建议：
+- `plugins.load.paths` 建议优先用**绝对路径**（除非你已确认当前 workspace）。
+- 如果配置里使用 `${JINA_API_KEY}`（或任何 `${...}` 变量），务必确保运行 Gateway 的**服务进程环境**里真的有这些变量（systemd/launchd/docker 通常不会继承你终端的 export）。
+- 修改插件配置后，运行 `openclaw gateway restart` 使其生效。
+
+### Jina API Key（Embedding + Rerank）如何填写
+
+- **Embedding**：将 `embedding.apiKey` 设置为你的 Jina key（推荐用环境变量 `${JINA_API_KEY}`）。
+- **Rerank**（当 `retrieval.rerankProvider: "jina"`）：通常可以直接复用同一个 Jina key，填到 `retrieval.rerankApiKey`。
+- 如果你选择了其它 rerank provider（如 `siliconflow` / `pinecone`），则 `retrieval.rerankApiKey` 应填写对应提供商的 key。
+
+Key 存储建议：
+- 不要把 key 提交到 git。
+- 使用 `${...}` 环境变量没问题，但务必确保运行 Gateway 的**服务进程环境**里真的有该变量（systemd/launchd/docker 往往不会继承你终端的 export）。
 
 ### 什么是 “OpenClaw workspace”？
 
@@ -169,7 +225,9 @@ Query → BM25 FTS ─────┘
 
 > 说明：OpenClaw 的配置文件通常在 `~/.openclaw/openclaw.json`，与 workspace 是分开的。
 
-**最常见的安装错误：** 把插件 clone 到别的目录，但在配置里仍然写 `"paths": ["plugins/memory-lancedb-pro"]`（这是**相对路径**）。OpenClaw 会去 workspace 下找 `plugins/memory-lancedb-pro`，导致加载失败，于是出现“安装位置不对”的反馈。
+**最常见的安装错误：** 把插件 clone 到别的目录，但在配置里仍然写类似 `"paths": ["plugins/memory-lancedb-pro"]` 的**相对路径**。相对路径的解析基准会受 Gateway 启动方式/工作目录影响，容易指向错误位置。
+
+为避免歧义：建议用**绝对路径**（方案 B），或把插件放在 `<workspace>/plugins/`（方案 A）并保持配置一致。
 
 ### 方案 A（推荐）：克隆到 workspace 的 `plugins/` 目录下
 
@@ -279,15 +337,15 @@ openclaw config get plugins.slots.memory
   },
   "dbPath": "~/.openclaw/memory/lancedb-pro",
   "autoCapture": true,
-  "autoRecall": true,
+  "autoRecall": false,
   "retrieval": {
     "mode": "hybrid",
     "vectorWeight": 0.7,
     "bm25Weight": 0.3,
     "minScore": 0.3,
     "rerank": "cross-encoder",
-    "rerankApiKey": "jina_xxx",
-    "rerankModel": "jina-reranker-v2-base-multilingual",
+    "rerankApiKey": "${JINA_API_KEY}",
+    "rerankModel": "jina-reranker-v3",
     "candidatePoolSize": 20,
     "recencyHalfLifeDays": 14,
     "recencyWeight": 0.1,
@@ -325,7 +383,144 @@ openclaw config get plugins.slots.memory
 | **Jina**（推荐） | `jina-embeddings-v5-text-small` | `https://api.jina.ai/v1` | 1024 |
 | **OpenAI** | `text-embedding-3-small` | `https://api.openai.com/v1` | 1536 |
 | **Google Gemini** | `gemini-embedding-001` | `https://generativelanguage.googleapis.com/v1beta/openai/` | 3072 |
-| **Ollama**（本地） | `nomic-embed-text` | `http://localhost:11434/v1` | 768 |
+| **Ollama**（本地） | `nomic-embed-text` | `http://localhost:11434/v1` | _与本地模型输出一致_（建议显式设置 `embedding.dimensions`） |
+
+---
+
+## （可选）从 Session JSONL 自动蒸馏记忆（全自动）
+
+OpenClaw 会把每个 Agent 的完整会话自动落盘为 JSONL：
+
+- `~/.openclaw/agents/<agentId>/sessions/*.jsonl`
+
+但 JSONL 含大量噪声（tool 输出、系统块、重复回调等），**不建议直接把原文塞进 LanceDB**。
+
+**推荐方案（2026-02+）**：使用 **/new 非阻塞沉淀管线**（Hooks + systemd worker），在你执行 `/new` 时异步提取高价值经验并写入 LanceDB Pro：
+
+- 触发：`command:new`（你在聊天里发送 `/new`）
+- Hook：只投递一个很小的 task.json（毫秒级，不调用 LLM，不阻塞 `/new`）
+- Worker：systemd 常驻进程监听队列，读取 session `.jsonl`，用 Gemini **Map-Reduce** 抽取 0～20 条高信噪比记忆
+- 写入：通过 `openclaw memory-pro import` 写入 LanceDB Pro（插件内部仍会 embedding + 查重）
+- 中文关键词：每条记忆包含 `Keywords (zh)`，并遵循三要素（实体/动作/症状）。其中“实体关键词”必须从 transcript 原文逐字拷贝（禁止编造项目名）。
+- 通知：可选（可做到即使 0 条也通知）
+
+示例文件：
+- `examples/new-session-distill/`
+
+---
+
+Legacy 方案：本插件也提供一个安全的 extractor 脚本 `scripts/jsonl_distill.py`，配合 OpenClaw 的 `cron` + 独立 distiller agent，实现“增量蒸馏 → 高质量记忆入库”：（适合不依赖 `/new` 的全自动场景）
+
+- 只读取每个 JSONL 文件**新增尾巴**（byte offset cursor），避免重复和 token 浪费
+- 生成一个小型 batch JSON
+- 由 distiller agent 把 batch 蒸馏成短、原子、可复用的记忆，再用 `memory_store` 写入
+
+### 你会得到什么
+
+- ✅ 全自动（每小时）
+- ✅ 多 Agent 支持（main + 各 bot）
+- ✅ 只处理新增内容（不回读）
+- ✅ 防自我吞噬：默认排除 `memory-distiller` 自己的 session
+
+### 脚本输出位置
+
+- Cursor：`~/.openclaw/state/jsonl-distill/cursor.json`
+- Batches：`~/.openclaw/state/jsonl-distill/batches/`
+
+> 脚本只读 session JSONL，不会修改原始日志。
+
+### （可选）启用 Agent 来源白名单（提高信噪比）
+
+默认情况下，extractor 会扫描 **所有 Agent**（但会排除 `memory-distiller` 自身，防止自我吞噬）。
+
+如果你只想从某些 Agent 蒸馏（例如只蒸馏 `main` + `code-agent`），可以设置环境变量：
+
+```bash
+export OPENCLAW_JSONL_DISTILL_ALLOWED_AGENT_IDS="main,code-agent"
+```
+
+- 不设置 / 空 / `*` / `all`：扫描全部（默认）
+- 逗号分隔列表：只扫描列表内 agentId
+
+### 推荐部署（独立 distiller agent）
+
+#### 1）创建 distiller agent（示例用 gpt-5.2）
+
+```bash
+openclaw agents add memory-distiller \
+  --non-interactive \
+  --workspace ~/.openclaw/workspace-memory-distiller \
+  --model openai-codex/gpt-5.2
+```
+
+#### 2）初始化 cursor（模式 A：从现在开始，不回溯历史）
+
+先确定插件目录（PLUGIN_DIR）：
+
+```bash
+# 如果你按推荐方式 clone 到 workspace：
+#   PLUGIN_DIR="$HOME/.openclaw/workspace/plugins/memory-lancedb-pro"
+PLUGIN_DIR="/path/to/memory-lancedb-pro"
+
+python3 "$PLUGIN_DIR/scripts/jsonl_distill.py" init
+```
+
+#### 3）创建每小时 Cron（Asia/Shanghai）
+
+建议 cron message 以 `run ...` 开头，这样本插件的自适应检索会跳过自动 recall 注入（节省 token）。
+
+```bash
+MSG=$(cat <<'EOF'
+run jsonl memory distill
+
+Goal: Distill ONLY new content from OpenClaw session JSONL tails into high-quality LanceDB memories.
+
+Hard rules:
+- Incremental only: exec the extractor. Do NOT scan full history.
+- If extractor returns action=noop: stop immediately.
+- Store only reusable memories (rules, pitfalls, decisions, preferences, stable facts). Skip routine chatter.
+- Each memory: idiomatic English + final line `Keywords (zh): ...` (3-8 short phrases).
+- Keep each memory < 500 chars and atomic.
+- Caps: <= 3 memories per agent per run; <= 3 global per run.
+- Scope:
+  - broadly reusable -> global
+  - agent-specific -> agent:<agentId>
+
+Workflow:
+1) exec: python3 <PLUGIN_DIR>/scripts/jsonl_distill.py run
+2) Determine batch file (created/pending)
+3) memory_store(...) for selected memories
+4) exec: python3 <PLUGIN_DIR>/scripts/jsonl_distill.py commit --batch-file <batchFile>
+EOF
+)
+
+openclaw cron add \
+  --agent memory-distiller \
+  --name "jsonl-memory-distill (hourly)" \
+  --cron "0 * * * *" \
+  --tz "Asia/Shanghai" \
+  --session isolated \
+  --wake now \
+  --timeout-seconds 420 \
+  --stagger 5m \
+  --no-deliver \
+  --message "$MSG"
+```
+
+### scope 策略（非常重要）
+
+当蒸馏“所有 agents”时，务必显式设置 scope：
+
+- 跨 agent 通用规则/偏好/坑 → `scope=global`
+- agent 私有 → `scope=agent:<agentId>`
+
+否则不同 bot 的记忆会相互污染。
+
+### 回滚
+
+- 禁用/删除 cron：`openclaw cron disable <jobId>` / `openclaw cron rm <jobId>`
+- 删除 distiller agent：`openclaw agents delete memory-distiller`
+- 删除 cursor 状态：`rm -rf ~/.openclaw/state/jsonl-distill/`
 
 ---
 
@@ -379,6 +574,61 @@ LanceDB 表 `memories`：
 
 ---
 
+## 常见问题 / 排错
+
+### "Cannot mix BigInt and other types"（LanceDB / Apache Arrow）
+
+在 LanceDB 0.26+（底层 Apache Arrow）中，部分数值列在运行时可能会以 `BigInt` 的形式返回（常见：`timestamp`、`importance`、`_distance`、`_score`）。如果你遇到类似报错：
+
+- `TypeError: Cannot mix BigInt and other types, use explicit conversions`
+
+请升级到 **memory-lancedb-pro >= 1.0.14**。插件已对这些字段统一做 `Number(...)` 转换后再参与运算（例如：计算分数、按时间排序）。
+
+## AI Agent 铁律（Iron Rules）
+
+> **OpenClaw 用户**：将下方代码块复制到你的 `AGENTS.md` 中，让 Agent 自动遵守这些规则。
+
+```markdown
+## Rule 1 — 双层记忆存储（铁律）
+
+Every pitfall/lesson learned → IMMEDIATELY store TWO memories to LanceDB before moving on:
+
+- **Technical layer**: Pitfall: [symptom]. Cause: [root cause]. Fix: [solution]. Prevention: [how to avoid]
+  (category: fact, importance ≥ 0.8)
+- **Principle layer**: Decision principle ([tag]): [behavioral rule]. Trigger: [when it applies]. Action: [what to do]
+  (category: decision, importance ≥ 0.85)
+- After each store, immediately `memory_recall` with anchor keywords to verify retrieval.
+  If not found, rewrite and re-store.
+- Missing either layer = incomplete.
+  Do NOT proceed to next topic until both are stored and verified.
+- Also update relevant SKILL.md files to prevent recurrence.
+
+## Rule 2 — LanceDB 卫生
+
+Entries must be short and atomic (< 500 chars). Never store raw conversation summaries, large blobs, or duplicates.
+Prefer structured format with keywords for retrieval.
+
+## Rule 3 — Recall before retry
+
+On ANY tool failure, repeated error, or unexpected behavior, ALWAYS `memory_recall` with relevant keywords
+(error message, tool name, symptom) BEFORE retrying. LanceDB likely already has the fix.
+Blind retries waste time and repeat known mistakes.
+
+## Rule 4 — 编辑前确认目标代码库
+
+When working on memory plugins, confirm you are editing the intended package
+(e.g., `memory-lancedb-pro` vs built-in `memory-lancedb`) before making changes;
+use `memory_recall` + filesystem search to avoid patching the wrong repo.
+
+## Rule 5 — 插件代码变更必须清 jiti 缓存（MANDATORY）
+
+After modifying ANY `.ts` file under `plugins/`, MUST run `rm -rf /tmp/jiti/` BEFORE `openclaw gateway restart`.
+jiti caches compiled TS; restart alone loads STALE code. This has caused silent bugs multiple times.
+Config-only changes do NOT need cache clearing.
+```
+
+---
+
 ## 依赖
 
 | 包 | 用途 |
@@ -388,6 +638,44 @@ LanceDB 表 `memories`：
 | `@sinclair/typebox` 0.34.48 | JSON Schema 类型定义（工具参数） |
 
 ---
+
+## 主要贡献者
+
+按 GitHub Contributors 列表自动生成（按 commit 贡献数排序，已排除 bot）：
+
+<p>
+<a href="https://github.com/win4r"><img src="https://avatars.githubusercontent.com/u/42172631?v=4" width="48" height="48" alt="@win4r" /></a>
+<a href="https://github.com/kctony"><img src="https://avatars.githubusercontent.com/u/1731141?v=4" width="48" height="48" alt="@kctony" /></a>
+<a href="https://github.com/Akatsuki-Ryu"><img src="https://avatars.githubusercontent.com/u/8062209?v=4" width="48" height="48" alt="@Akatsuki-Ryu" /></a>
+<a href="https://github.com/JasonSuz"><img src="https://avatars.githubusercontent.com/u/612256?v=4" width="48" height="48" alt="@JasonSuz" /></a>
+<a href="https://github.com/Minidoracat"><img src="https://avatars.githubusercontent.com/u/11269639?v=4" width="48" height="48" alt="@Minidoracat" /></a>
+<a href="https://github.com/furedericca-lab"><img src="https://avatars.githubusercontent.com/u/263020793?v=4" width="48" height="48" alt="@furedericca-lab" /></a>
+<a href="https://github.com/joe2643"><img src="https://avatars.githubusercontent.com/u/19421931?v=4" width="48" height="48" alt="@joe2643" /></a>
+<a href="https://github.com/AliceLJY"><img src="https://avatars.githubusercontent.com/u/136287420?v=4" width="48" height="48" alt="@AliceLJY" /></a>
+<a href="https://github.com/chenjiyong"><img src="https://avatars.githubusercontent.com/u/8199522?v=4" width="48" height="48" alt="@chenjiyong" /></a>
+</p>
+
+- [@win4r](https://github.com/win4r)（3 次提交）
+- [@kctony](https://github.com/kctony)（2 次提交）
+- [@Akatsuki-Ryu](https://github.com/Akatsuki-Ryu)（1 次提交）
+- [@AliceLJY](https://github.com/AliceLJY)（1 次提交）
+- [@chenjiyong](https://github.com/chenjiyong)（1 次提交）
+- [@JasonSuz](https://github.com/JasonSuz)（1 次提交）
+- [@Minidoracat](https://github.com/Minidoracat)（1 次提交）
+- [@furedericca-lab](https://github.com/furedericca-lab)（1 次提交）
+- [@joe2643](https://github.com/joe2643)（1 次提交）
+
+完整列表：https://github.com/win4r/memory-lancedb-pro/graphs/contributors
+
+## ⭐ Star 趋势
+
+<a href="https://star-history.com/#win4r/memory-lancedb-pro&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=win4r/memory-lancedb-pro&type=Date&theme=dark&transparent=true" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=win4r/memory-lancedb-pro&type=Date&transparent=true" />
+    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=win4r/memory-lancedb-pro&type=Date&transparent=true" />
+  </picture>
+</a>
 
 ## License
 

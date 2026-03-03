@@ -4,6 +4,8 @@
 
 import type * as LanceDB from "@lancedb/lancedb";
 import { randomUUID } from "node:crypto";
+import { existsSync, accessSync, constants, mkdirSync, realpathSync, lstatSync } from "node:fs";
+import { dirname } from "node:path";
 
 // ============================================================================
 // Types
@@ -61,6 +63,72 @@ function escapeSqlLiteral(value: string): string {
 }
 
 // ============================================================================
+// Storage Path Validation
+// ============================================================================
+
+/**
+ * Validate and prepare the storage directory before LanceDB connection.
+ * Resolves symlinks, creates missing directories, and checks write permissions.
+ * Returns the resolved absolute path on success, or throws a descriptive error.
+ */
+export function validateStoragePath(dbPath: string): string {
+  let resolvedPath = dbPath;
+
+  // Resolve symlinks (including dangling symlinks)
+  try {
+    const stats = lstatSync(dbPath);
+    if (stats.isSymbolicLink()) {
+      try {
+        resolvedPath = realpathSync(dbPath);
+      } catch (err: any) {
+        throw new Error(
+          `dbPath "${dbPath}" is a symlink whose target does not exist.\n` +
+          `  Fix: Create the target directory, or update the symlink to point to a valid path.\n` +
+          `  Details: ${err.code || ""} ${err.message}`
+        );
+      }
+    }
+  } catch (err: any) {
+    // Missing path is OK (it will be created below)
+    if (err?.code === "ENOENT") {
+      // no-op
+    } else if (typeof err?.message === "string" && err.message.includes("symlink whose target does not exist")) {
+      throw err;
+    } else {
+      // Other lstat failures — continue with original path
+    }
+  }
+
+  // Create directory if it doesn't exist
+  if (!existsSync(resolvedPath)) {
+    try {
+      mkdirSync(resolvedPath, { recursive: true });
+    } catch (err: any) {
+      throw new Error(
+        `Failed to create dbPath directory "${resolvedPath}".\n` +
+        `  Fix: Ensure the parent directory "${dirname(resolvedPath)}" exists and is writable,\n` +
+        `       or create it manually: mkdir -p "${resolvedPath}"\n` +
+        `  Details: ${err.code || ""} ${err.message}`
+      );
+    }
+  }
+
+  // Check write permissions
+  try {
+    accessSync(resolvedPath, constants.W_OK);
+  } catch (err: any) {
+    throw new Error(
+      `dbPath directory "${resolvedPath}" is not writable.\n` +
+      `  Fix: Check permissions with: ls -la "${dirname(resolvedPath)}"\n` +
+      `       Or grant write access: chmod u+w "${resolvedPath}"\n` +
+      `  Details: ${err.code || ""} ${err.message}`
+    );
+  }
+
+  return resolvedPath;
+}
+
+// ============================================================================
 // Memory Store
 // ============================================================================
 
@@ -95,7 +163,19 @@ export class MemoryStore {
 
   private async doInitialize(): Promise<void> {
     const lancedb = await loadLanceDB();
-    const db = await lancedb.connect(this.config.dbPath);
+
+    let db: LanceDB.Connection;
+    try {
+      db = await lancedb.connect(this.config.dbPath);
+    } catch (err: any) {
+      const code = err.code || "";
+      const message = err.message || String(err);
+      throw new Error(
+        `Failed to open LanceDB at "${this.config.dbPath}": ${code} ${message}\n` +
+        `  Fix: Verify the path exists and is writable. Check parent directory permissions.`
+      );
+    }
+
     let table: LanceDB.Table;
 
     // Idempotent table init: try openTable first, create only if missing,
@@ -196,7 +276,15 @@ export class MemoryStore {
       metadata: entry.metadata || "{}",
     };
 
-    await this.table!.add([fullEntry]);
+    try {
+      await this.table!.add([fullEntry]);
+    } catch (err: any) {
+      const code = err.code || "";
+      const message = err.message || String(err);
+      throw new Error(
+        `Failed to store memory in "${this.config.dbPath}": ${code} ${message}`
+      );
+    }
     return fullEntry;
   }
 
@@ -258,7 +346,7 @@ export class MemoryStore {
     const mapped: MemorySearchResult[] = [];
 
     for (const row of results) {
-      const distance = row._distance ?? 0;
+      const distance = Number(row._distance ?? 0);
       const score = 1 / (1 + distance);
 
       if (score < minScore) continue;
@@ -277,8 +365,8 @@ export class MemoryStore {
           vector: row.vector as number[],
           category: row.category as MemoryEntry["category"],
           scope: rowScope,
-          importance: row.importance as number,
-          timestamp: row.timestamp as number,
+          importance: Number(row.importance),
+          timestamp: Number(row.timestamp),
           metadata: (row.metadata as string) || "{}",
         },
         score,
@@ -323,7 +411,8 @@ export class MemoryStore {
         }
 
         // LanceDB FTS _score is raw BM25 (unbounded). Normalize with sigmoid.
-        const rawScore = typeof row._score === "number" ? row._score : 0;
+        // LanceDB may return BigInt for numeric columns; coerce safely.
+        const rawScore = (row._score != null) ? Number(row._score) : 0;
         const normalizedScore = rawScore > 0 ? 1 / (1 + Math.exp(-rawScore / 5)) : 0.5;
 
         mapped.push({
@@ -333,8 +422,8 @@ export class MemoryStore {
             vector: row.vector as number[],
             category: row.category as MemoryEntry["category"],
             scope: rowScope,
-            importance: row.importance as number,
-            timestamp: row.timestamp as number,
+            importance: Number(row.importance),
+            timestamp: Number(row.timestamp),
             metadata: (row.metadata as string) || "{}",
           },
           score: normalizedScore,
@@ -423,8 +512,8 @@ export class MemoryStore {
         vector: [], // Don't include vectors in list results for performance
         category: row.category as MemoryEntry["category"],
         scope: (row.scope as string | undefined) ?? "global",
-        importance: row.importance as number,
-        timestamp: row.timestamp as number,
+        importance: Number(row.importance),
+        timestamp: Number(row.timestamp),
         metadata: (row.metadata as string) || "{}",
       }))
       .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
@@ -514,8 +603,8 @@ export class MemoryStore {
       vector: updates.vector ?? (Array.from(row.vector as Iterable<number>)),
       category: updates.category ?? (row.category as MemoryEntry["category"]),
       scope: rowScope,
-      importance: updates.importance ?? (row.importance as number),
-      timestamp: row.timestamp as number, // preserve original
+      importance: updates.importance ?? Number(row.importance),
+      timestamp: Number(row.timestamp), // preserve original
       metadata: updates.metadata ?? ((row.metadata as string) || "{}"),
     };
 
