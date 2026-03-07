@@ -286,6 +286,20 @@ Query → BM25 FTS ─────┘
 
 ## 安装
 
+> **🧪 Beta 版本可用：v1.1.0-beta.3**
+>
+> Beta 版包含多项重大新特性：**Self-Improvement 治理流**、**memoryReflection 会话策略**、**Markdown 镜像双写**、以及改进的 Embedding 错误诊断。稳定版 `latest` 仍为 v1.0.32。
+>
+> ```bash
+> # 安装 beta（手动选择）
+> npm install memory-lancedb-pro@beta
+>
+> # 安装稳定版（默认）
+> npm install memory-lancedb-pro
+> ```
+>
+> 详见 [Release Notes](https://github.com/win4r/memory-lancedb-pro/releases/tag/v1.1.0-beta.3)。欢迎通过 [GitHub Issues](https://github.com/win4r/memory-lancedb-pro/issues) 反馈问题。
+
 ### AI 安装指引（防幻觉版）
 
 如果你是用 AI 按 README 操作，**不要假设任何默认值**。请先运行以下命令，并以真实输出为准：
