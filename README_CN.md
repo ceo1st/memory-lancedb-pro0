@@ -169,6 +169,7 @@ Query → BM25 FTS ─────┘
   - 治理类 extract/review 动作仍然是显式工具触发，不是后台自动触发。
 - 工具：
   - `self_improvement_log`：写入结构化 LRN/ERR/FEAT 条目
+  - Reflection 自动提升：当 reflection 落盘且 `## Lessons & pitfalls (symptom / cause / fix / prevention)` 含有非占位 bullet 时，插件会额外向 `.learnings/LEARNINGS.md` 追加一条结构化 `learning` 记录，并把 reflection 文件路径记为来源。
   - `self_improvement_review`：汇总治理 backlog（pending/high/promoted）
   - `self_improvement_extract_skill`：从学习条目提炼可复用 `SKILL.md` 脚手架
     - 触发者：由用户/模型显式调用工具触发（非后台自动触发）
@@ -188,7 +189,7 @@ Query → BM25 FTS ─────┘
   - 若 embedded 路径失败，自动回退到 `openclaw agent --local --json`。
   - 仅当两者都失败时，才写入最小 fallback 反思文本。
 - Reflect 产物：
-  - 结构化输出应包含这些段落：`## Context (session background)`、`## Decisions (durable)`、`## Preference (stable preferences / observed preference deltas)`、`## Fact (durable facts / verified state)`、`## Entity (people / repos / services / identifiers)`、`## User model deltas (about the human)`、`## Agent model deltas (about the assistant/system)`、`## Lessons & pitfalls (symptom / cause / fix / prevention)`、`## Learning governance candidates (.learnings / promotion / skill extraction)`、`## Open loops / next actions`、`## Retrieval tags / keywords`、`## Invariants`、`## Derived`。
+  - 结构化输出应包含这些段落：`## Context (session background)`、`## Decisions (durable)`、`## User model deltas (about the human)`、`## Agent model deltas (about the assistant/system)`、`## Lessons & pitfalls (symptom / cause / fix / prevention)`、`## Learning governance candidates (.learnings / promotion / skill extraction)`、`## Open loops / next actions`、`## Retrieval tags / keywords`、`## Invariants`、`## Derived`。
   - `## Invariants` 用于稳定规则沉淀；`## Derived` 用于下一次执行增量。
   - Markdown 产物写入 `memory/reflections/YYYY-MM-DD/`。
   - 文件名为高精度时间戳 + agent/session token（带冲突后缀），例如 `HHMMSSmmm-agent-session[-xxxxxx].md`。

@@ -169,6 +169,7 @@ Filters out low-quality content at both auto-capture and tool-store stages:
   - Governance-oriented extraction/review actions remain explicitly tool-driven rather than background-triggered.
 - Tools:
   - `self_improvement_log`: write structured LRN/ERR/FEAT entries
+  - Reflection auto-promotion: when a reflection is persisted and `## Lessons & pitfalls (symptom / cause / fix / prevention)` contains non-placeholder bullets, the plugin also appends a structured `learning` entry to `.learnings/LEARNINGS.md` with the reflection file path as source.
   - `self_improvement_review`: summarize governance backlog (pending/high/promoted)
   - `self_improvement_extract_skill`: extract a reusable `SKILL.md` scaffold from a learning entry
     - Trigger: explicit tool call by user/model (not background auto-trigger)
@@ -188,7 +189,7 @@ Filters out low-quality content at both auto-capture and tool-store stages:
   - If embedded path fails, automatically fallback to `openclaw agent --local --json`.
   - Only if both fail, write minimal fallback reflection text.
 - Reflect output:
-  - Structured output should include these sections: `## Context (session background)`, `## Decisions (durable)`, `## Preference (stable preferences / observed preference deltas)`, `## Fact (durable facts / verified state)`, `## Entity (people / repos / services / identifiers)`, `## User model deltas (about the human)`, `## Agent model deltas (about the assistant/system)`, `## Lessons & pitfalls (symptom / cause / fix / prevention)`, `## Learning governance candidates (.learnings / promotion / skill extraction)`, `## Open loops / next actions`, `## Retrieval tags / keywords`, `## Invariants`, `## Derived`.
+  - Structured output should include these sections: `## Context (session background)`, `## Decisions (durable)`, `## User model deltas (about the human)`, `## Agent model deltas (about the assistant/system)`, `## Lessons & pitfalls (symptom / cause / fix / prevention)`, `## Learning governance candidates (.learnings / promotion / skill extraction)`, `## Open loops / next actions`, `## Retrieval tags / keywords`, `## Invariants`, `## Derived`.
   - `## Invariants` is for stable rule-like carryover; `## Derived` is for concrete next-run deltas.
   - Markdown artifacts are written under `memory/reflections/YYYY-MM-DD/`.
   - Filename uses high-resolution timestamp + agent/session token (with conflict-safe suffix), for example `HHMMSSmmm-agent-session[-xxxxxx].md`.

@@ -18,6 +18,8 @@ const {
   registerSelfImprovementLogTool,
   registerSelfImprovementExtractSkillTool,
 } = jiti("../src/tools.ts");
+const { appendSelfImprovementEntry } = jiti("../src/self-improvement-files.ts");
+const { extractReflectionLessons, extractReflectionMappedMemories } = jiti("../src/reflection-slices.ts");
 
 function createToolHarness(workspaceDir) {
   const factories = new Map();
@@ -58,6 +60,82 @@ describe("self-improvement", () => {
 
     afterEach(() => {
       rmSync(workspaceDir, { recursive: true, force: true });
+    });
+
+    it("extracts mapped reflection sections into preference/fact/decision memories", async () => {
+      const reflectionText = [
+        "## Context (session background)",
+        "- (none captured)",
+        "",
+        "## Decisions (durable)",
+        "- Always verify file evidence before reporting completion.",
+        "",
+        "## User model deltas (about the human)",
+        "- Prefers concise direct answers without confirmation loops.",
+        "",
+        "## Agent model deltas (about the assistant/system)",
+        "- Should label empty-state status as triage before calling it a failure.",
+        "",
+        "## Learning governance candidates (.learnings / promotion / skill extraction)",
+        "- LRN candidate: require file evidence before saying a skill was updated.",
+      ].join("\n");
+      const mapped = extractReflectionMappedMemories(reflectionText);
+      assert.deepEqual(mapped, [
+        {
+          text: "Prefers concise direct answers without confirmation loops.",
+          category: "preference",
+          heading: "User model deltas (about the human)",
+        },
+        {
+          text: "Should label empty-state status as triage before calling it a failure.",
+          category: "preference",
+          heading: "Agent model deltas (about the assistant/system)",
+        },
+        {
+          text: "LRN candidate: require file evidence before saying a skill was updated.",
+          category: "fact",
+          heading: "Learning governance candidates (.learnings / promotion / skill extraction)",
+        },
+        {
+          text: "Always verify file evidence before reporting completion.",
+          category: "decision",
+          heading: "Decisions (durable)",
+        },
+      ]);
+    });
+
+    it("appends reflection lessons into LEARNINGS.md with structured entry ids", async () => {
+      const reflectionText = [
+        "## Context (session background)",
+        "- (none captured)",
+        "",
+        "## Lessons & pitfalls (symptom / cause / fix / prevention)",
+        "- Symptom: empty-state status looked like a failure. Cause: no explicit triage label. Fix: classify empty-state as triage first. Prevention: avoid calling it breakage without reproduction.",
+        "- Symptom: reported done without file proof. Cause: conversation claim outran file verification. Fix: attach file evidence before declaring completion. Prevention: always verify real paths before reporting.",
+      ].join("\n");
+      const lessons = extractReflectionLessons(reflectionText);
+      assert.deepEqual(lessons, [
+        "Symptom: empty-state status looked like a failure. Cause: no explicit triage label. Fix: classify empty-state as triage first. Prevention: avoid calling it breakage without reproduction.",
+        "Symptom: reported done without file proof. Cause: conversation claim outran file verification. Fix: attach file evidence before declaring completion. Prevention: always verify real paths before reporting.",
+      ]);
+
+      const appended = await appendSelfImprovementEntry({
+        baseDir: workspaceDir,
+        type: "learning",
+        summary: "Reflection lessons & pitfalls from command:reset",
+        details: lessons.map((line) => `- ${line}`).join("\n"),
+        suggestedAction: "Review and promote stable rules when they recur.",
+        source: "memory-lancedb-pro/reflection:test",
+      });
+
+      assert.match(appended.id, /^LRN-\d{8}-001$/);
+      const learningsPath = path.join(workspaceDir, ".learnings", "LEARNINGS.md");
+      const learningsBody = readFileSync(learningsPath, "utf-8");
+      assert.match(learningsBody, /## \[LRN-\d{8}-001\] best_practice/);
+      assert.match(learningsBody, /Reflection lessons & pitfalls from command:reset/);
+      assert.match(learningsBody, /empty-state status looked like a failure/);
+      assert.match(learningsBody, /attach file evidence before declaring completion/);
+      assert.match(learningsBody, /Source: memory-lancedb-pro\/reflection:test/);
     });
 
     it("handles learning id validation and writes promoted skill scaffold with sanitized outputDir", async () => {

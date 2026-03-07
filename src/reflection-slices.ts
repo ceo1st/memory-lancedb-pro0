@@ -3,7 +3,13 @@ export interface ReflectionSlices {
   derived: string[];
 }
 
-function parseSectionBullets(markdown: string, heading: string): string[] {
+export interface ReflectionMappedMemory {
+  text: string;
+  category: "preference" | "fact" | "decision";
+  heading: string;
+}
+
+export function parseSectionBullets(markdown: string, heading: string): string[] {
   const lines = markdown.split(/\r?\n/);
   const headingNeedle = `## ${heading}`.toLowerCase();
   let inSection = false;
@@ -60,6 +66,23 @@ function isDerivedDeltaLike(line: string): boolean {
 
 function isOpenLoopAction(line: string): boolean {
   return /^(investigate|verify|confirm|re-check|retest|update|add|remove|fix|avoid|keep|watch|document)\b/i.test(line);
+}
+
+export function extractReflectionLessons(reflectionText: string): string[] {
+  return sanitizeReflectionSliceLines(parseSectionBullets(reflectionText, "Lessons & pitfalls (symptom / cause / fix / prevention)"));
+}
+
+export function extractReflectionMappedMemories(reflectionText: string): ReflectionMappedMemory[] {
+  const mappedSections: Array<{ heading: string; category: "preference" | "fact" | "decision" }> = [
+    { heading: "User model deltas (about the human)", category: "preference" },
+    { heading: "Agent model deltas (about the assistant/system)", category: "preference" },
+    { heading: "Learning governance candidates (.learnings / promotion / skill extraction)", category: "fact" },
+    { heading: "Decisions (durable)", category: "decision" },
+  ];
+
+  return mappedSections.flatMap(({ heading, category }) =>
+    sanitizeReflectionSliceLines(parseSectionBullets(reflectionText, heading)).map((text) => ({ text, category, heading }))
+  );
 }
 
 export function extractReflectionSlices(reflectionText: string): ReflectionSlices {

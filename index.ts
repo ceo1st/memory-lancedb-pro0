@@ -20,7 +20,7 @@ import { createRetriever, DEFAULT_RETRIEVAL_CONFIG } from "./src/retriever.js";
 import { createScopeManager } from "./src/scopes.js";
 import { createMigrator } from "./src/migrate.js";
 import { registerAllMemoryTools } from "./src/tools.js";
-import { ensureSelfImprovementLearningFiles } from "./src/self-improvement-files.js";
+import { appendSelfImprovementEntry, ensureSelfImprovementLearningFiles } from "./src/self-improvement-files.js";
 import type { MdMirrorWriter } from "./src/tools.js";
 import { shouldSkipRetrieval } from "./src/adaptive-retrieval.js";
 import { AccessTracker } from "./src/access-tracker.js";
@@ -31,6 +31,7 @@ import {
   loadAgentReflectionSlicesFromEntries,
   DEFAULT_REFLECTION_DERIVED_MAX_AGE_MS,
 } from "./src/reflection-store.js";
+import { extractReflectionLessons, extractReflectionMappedMemories } from "./src/reflection-slices.js";
 import { createMemoryCLI } from "./cli.js";
 
 // ============================================================================
@@ -696,9 +697,6 @@ function buildReflectionPrompt(
     "Output sections (use these exact headings):",
     "## Context (session background)",
     "## Decisions (durable)",
-    "## Preference (stable preferences / observed preference deltas)",
-    "## Fact (durable facts / verified state)",
-    "## Entity (people / repos / services / identifiers)",
     "## User model deltas (about the human)",
     "## Agent model deltas (about the assistant/system)",
     "## Lessons & pitfalls (symptom / cause / fix / prevention)",
@@ -739,15 +737,6 @@ function buildReflectionFallbackText(): string {
     `- ${REFLECTION_FALLBACK_MARKER}`,
     "",
     "## Decisions (durable)",
-    "- (none captured)",
-    "",
-    "## Preference (stable preferences / observed preference deltas)",
-    "- (none captured)",
-    "",
-    "## Fact (durable facts / verified state)",
-    "- (none captured)",
-    "",
-    "## Entity (people / repos / services / identifiers)",
     "- (none captured)",
     "",
     "## User model deltas (about the human)",
@@ -1672,7 +1661,6 @@ const memoryLanceDBProPlugin = {
                 "  - .learnings/FEATURE_REQUESTS.md (missing capability)",
                 "- Distill reusable rules to AGENTS.md / SOUL.md / TOOLS.md.",
                 "- If reusable across tasks, extract a new skill from the learning.",
-                "- Reflect -> Store -> Inherit -> Derive -> Apply.",
                 "- Then proceed with the new session.",
               ].join("\n")
             );
@@ -1947,6 +1935,67 @@ const memoryLanceDBProPlugin = {
           }
           if (!writeOk) {
             throw new Error(`Failed to allocate unique reflection file for ${dateStr} ${timeCompact}`);
+          }
+
+          const reflectionLessons = extractReflectionLessons(reflectionText);
+          if (config.selfImprovement?.enabled !== false && reflectionLessons.length > 0) {
+            await appendSelfImprovementEntry({
+              baseDir: workspaceDir,
+              type: "learning",
+              summary: `Reflection lessons & pitfalls from ${String(event.action || "unknown")}`,
+              details: reflectionLessons.map((line) => `- ${line}`).join("\n"),
+              suggestedAction: "Review the reflection lessons, promote durable rules to AGENTS.md / SOUL.md / TOOLS.md when stable, and extract a skill if the pattern becomes reusable.",
+              category: "best_practice",
+              area: "config",
+              priority: "medium",
+              source: `memory-lancedb-pro/reflection:${relPath}`,
+            });
+          }
+
+          const mappedReflectionMemories = extractReflectionMappedMemories(reflectionText);
+          for (const mapped of mappedReflectionMemories) {
+            const vector = await embedder.embedPassage(mapped.text);
+            let existing: Awaited<ReturnType<typeof store.vectorSearch>> = [];
+            try {
+              existing = await store.vectorSearch(vector, 1, 0.1, [targetScope]);
+            } catch (err) {
+              api.logger.warn(
+                `memory-reflection: mapped memory duplicate pre-check failed, continue store: ${String(err)}`,
+              );
+            }
+
+            if (existing.length > 0 && existing[0].score > 0.95) {
+              continue;
+            }
+
+            const importance = mapped.category === "decision" ? 0.85 : 0.8;
+            const metadata = JSON.stringify({
+              type: "memory-reflection-section",
+              stage: "reflect-store",
+              reflectionSource: relPath,
+              reflectionCommand: String(event.action || "unknown"),
+              section: mapped.heading,
+              agentId: sourceAgentId,
+              sessionKey,
+              sessionId: currentSessionId || "unknown",
+              storedAt: nowTs,
+            });
+
+            const storedEntry = await store.store({
+              text: mapped.text,
+              vector,
+              importance,
+              category: mapped.category,
+              scope: targetScope,
+              metadata,
+            });
+
+            if (mdMirror) {
+              await mdMirror(
+                { text: mapped.text, category: mapped.category, scope: targetScope, timestamp: storedEntry.timestamp },
+                { source: `reflection:${mapped.heading}`, agentId: sourceAgentId },
+              );
+            }
           }
 
           if (reflectionStoreToLanceDB) {
