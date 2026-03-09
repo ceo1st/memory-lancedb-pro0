@@ -31,6 +31,8 @@ ${conversationText}
 - Temporary information: One-time questions or conversations
 - Vague information: "User has questions about a feature" (no specific details)
 - Tool output, error logs, or boilerplate
+- Recall queries / meta-questions: "Do you remember X?", "你还记得X吗?", "你知道我喜欢什么吗" — these are retrieval requests, NOT new information to store
+- Degraded or incomplete references: If the user mentions something vaguely ("that thing I said"), do NOT invent details or create a hollow memory
 
 # Memory Classification
 
@@ -144,12 +146,14 @@ Content: ${candidateContent}
 ${existingMemories}
 
 Please decide:
-- SKIP: Candidate memory duplicates existing memories, no need to save
-- CREATE: This is completely new information, should be created
-- MERGE: Candidate memory should be merged with an existing memory
+- SKIP: Candidate memory duplicates existing memories, no need to save. Also SKIP if the candidate contains LESS information than an existing memory on the same topic (information degradation — e.g., candidate says "programming language preference" but existing memory already says "programming language preference: Python, TypeScript")
+- CREATE: This is completely new information not covered by any existing memory, should be created
+- MERGE: Candidate memory adds genuinely NEW details to an existing memory and should be merged
 
-IMPORTANT: "events" and "cases" categories are independent records — they do NOT support MERGE.
-For these categories, only use SKIP or CREATE.
+IMPORTANT:
+- "events" and "cases" categories are independent records — they do NOT support MERGE. For these categories, only use SKIP or CREATE.
+- If the candidate appears to be derived from a recall question (e.g., "Do you remember X?" / "你记得X吗？") and an existing memory already covers topic X with equal or more detail, you MUST choose SKIP.
+- A candidate with less information than an existing memory on the same topic should NEVER be CREATED or MERGED — always SKIP.
 
 Return JSON format:
 {

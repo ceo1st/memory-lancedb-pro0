@@ -625,6 +625,11 @@ function extractTextContent(content: unknown): string | null {
   return null;
 }
 
+/**
+ * Check if a message should be skipped (slash commands, injected recall/system blocks).
+ * Used by both the **reflection** pipeline (session JSONL reading) and the
+ * **auto-capture** pipeline (via `normalizeAutoCaptureText`) as a final guard.
+ */
 function shouldSkipReflectionMessage(role: string, text: string): boolean {
   const trimmed = text.trim();
   if (!trimmed) return true;
@@ -655,6 +660,7 @@ const AUTO_CAPTURE_INBOUND_META_SENTINELS = [
 const AUTO_CAPTURE_SESSION_RESET_PREFIX =
   "A new session was started via /new or /reset. Execute your Session Startup sequence now";
 const AUTO_CAPTURE_ADDRESSING_PREFIX_RE = /^(?:<@!?[0-9]+>|@[A-Za-z0-9_.-]+)\s*/;
+const AUTO_CAPTURE_MAP_MAX_ENTRIES = 2000;
 const AUTO_CAPTURE_EXPLICIT_REMEMBER_RE =
   /^(?:请|請)?(?:记住|記住|记一下|記一下|别忘了|別忘了)[。.!?？!]*$/u;
 
@@ -685,6 +691,11 @@ function stripLeadingInboundMetadata(text: string): string {
         index++;
       }
     } else {
+      // Sentinel line not followed by a ```json fenced block — unexpected format.
+      // Log and return original text to avoid lossy stripping.
+      _autoCaptureDebugLog(
+        `memory-lancedb-pro: stripLeadingInboundMetadata: sentinel line not followed by json fenced block at line ${index}, returning original text`,
+      );
       return text;
     }
 
@@ -694,6 +705,20 @@ function stripLeadingInboundMetadata(text: string): string {
   }
 
   return lines.slice(index).join("\n").trim();
+}
+
+/**
+ * Prune a Map to stay within the given maximum number of entries.
+ * Deletes the oldest (earliest-inserted) keys when over the limit.
+ */
+function pruneMapIfOver<K, V>(map: Map<K, V>, maxEntries: number): void {
+  if (map.size <= maxEntries) return;
+  const excess = map.size - maxEntries;
+  const iter = map.keys();
+  for (let i = 0; i < excess; i++) {
+    const key = iter.next().value;
+    if (key !== undefined) map.delete(key);
+  }
 }
 
 function stripAutoCaptureSessionResetPrefix(text: string): string {
@@ -732,6 +757,13 @@ function buildAutoCaptureConversationKeyFromIngress(
   return `${channel}:${conversation}`;
 }
 
+/**
+ * Extract the conversation portion from a sessionKey.
+ * Expected format: `agent:<agentId>:<channelId>:<conversationId>`
+ * where `<agentId>` does not contain colons. Returns everything after
+ * the second colon as the conversation key, or null if the format
+ * does not match.
+ */
 function buildAutoCaptureConversationKeyFromSessionKey(sessionKey: string): string | null {
   const trimmed = sessionKey.trim();
   if (!trimmed) return null;
@@ -756,6 +788,9 @@ function stripAutoCaptureInjectedPrefix(role: string, text: string): string {
   normalized = stripAutoCaptureAddressingPrefix(normalized);
   return normalized.trim();
 }
+
+/** Module-level debug logger for auto-capture helpers; set during plugin registration. */
+let _autoCaptureDebugLog: (msg: string) => void = () => { };
 
 function normalizeAutoCaptureText(role: unknown, text: string): string | null {
   if (typeof role !== "string") return null;
@@ -1427,7 +1462,7 @@ async function findPreviousSessionFile(
       );
       if (nonReset.length > 0) return join(sessionsDir, nonReset[0]);
     }
-  } catch {}
+  } catch { }
 }
 
 // ============================================================================
@@ -1558,7 +1593,7 @@ const memoryLanceDBProPlugin = {
     } catch (err) {
       api.logger.warn(
         `memory-lancedb-pro: storage path issue — ${String(err)}\n` +
-          `  The plugin will still attempt to start, but writes may fail.`,
+        `  The plugin will still attempt to start, but writes may fail.`,
       );
     }
 
@@ -1829,9 +1864,14 @@ const memoryLanceDBProPlugin = {
     const turnCounter = new Map<string, number>();
 
     // Track how many normalized user texts have already been seen per session snapshot.
+    // All three Maps are pruned to AUTO_CAPTURE_MAP_MAX_ENTRIES to prevent unbounded
+    // growth in long-running processes with many distinct sessions.
     const autoCaptureSeenTextCount = new Map<string, number>();
     const autoCapturePendingIngressTexts = new Map<string, string[]>();
     const autoCaptureRecentTexts = new Map<string, string[]>();
+
+    // Wire up the module-level debug logger for pure helper functions.
+    _autoCaptureDebugLog = (msg: string) => api.logger.debug(msg);
 
     api.logger.info(
       `memory-lancedb-pro@${pluginVersion}: plugin registered (db: ${resolvedDbPath}, model: ${config.embedding.model || "text-embedding-3-small"}, smartExtraction: ${smartExtractor ? 'ON' : 'OFF'})`
@@ -1848,6 +1888,7 @@ const memoryLanceDBProPlugin = {
         const queue = autoCapturePendingIngressTexts.get(conversationKey) || [];
         queue.push(normalized);
         autoCapturePendingIngressTexts.set(conversationKey, queue.slice(-6));
+        pruneMapIfOver(autoCapturePendingIngressTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
       }
       api.logger.debug(
         `memory-lancedb-pro: ingress message_received channel=${ctx.channelId} account=${ctx.accountId || "unknown"} conversation=${ctx.conversationId || "unknown"} from=${event.from} len=${event.content.trim().length} preview=${summarizeTextPreview(event.content)}`,
@@ -2117,6 +2158,7 @@ const memoryLanceDBProPlugin = {
             newTexts = eligibleTexts.slice(previousSeenCount);
           }
           autoCaptureSeenTextCount.set(sessionKey, eligibleTexts.length);
+          pruneMapIfOver(autoCaptureSeenTextCount, AUTO_CAPTURE_MAP_MAX_ENTRIES);
 
           const priorRecentTexts = autoCaptureRecentTexts.get(sessionKey) || [];
           let texts = newTexts;
@@ -2130,6 +2172,7 @@ const memoryLanceDBProPlugin = {
           if (newTexts.length > 0) {
             const nextRecentTexts = [...priorRecentTexts, ...newTexts].slice(-6);
             autoCaptureRecentTexts.set(sessionKey, nextRecentTexts);
+            pruneMapIfOver(autoCaptureRecentTexts, AUTO_CAPTURE_MAP_MAX_ENTRIES);
           }
 
           const minMessages = config.extractMinMessages ?? 2;
@@ -2973,7 +3016,7 @@ const memoryLanceDBProPlugin = {
         if (files.length > 7) {
           const { unlink } = await import("node:fs/promises");
           for (const old of files.slice(0, files.length - 7)) {
-            await unlink(join(backupDir, old)).catch(() => {});
+            await unlink(join(backupDir, old)).catch(() => { });
           }
         }
 
@@ -3031,10 +3074,10 @@ const memoryLanceDBProPlugin = {
 
             api.logger.info(
               `memory-lancedb-pro: initialized successfully ` +
-                `(embedding: ${embedTest.success ? "OK" : "FAIL"}, ` +
-                `retrieval: ${retrievalTest.success ? "OK" : "FAIL"}, ` +
-                `mode: ${retrievalTest.mode}, ` +
-                `FTS: ${retrievalTest.hasFtsSupport ? "enabled" : "disabled"})`,
+              `(embedding: ${embedTest.success ? "OK" : "FAIL"}, ` +
+              `retrieval: ${retrievalTest.success ? "OK" : "FAIL"}, ` +
+              `mode: ${retrievalTest.mode}, ` +
+              `FTS: ${retrievalTest.hasFtsSupport ? "enabled" : "disabled"})`,
             );
 
             if (!embedTest.success) {
@@ -3140,7 +3183,7 @@ export function parsePluginConfig(value: unknown): PluginConfig {
       ? sessionStrategyRaw
       : legacySessionMemoryEnabled === true
         ? "systemSessionMemory"
-      : "none";
+        : "none";
   const reflectionMessageCount = parsePositiveInt(memoryReflectionRaw?.messageCount ?? sessionMemoryRaw?.messageCount) ?? DEFAULT_REFLECTION_MESSAGE_COUNT;
   const injectModeRaw = memoryReflectionRaw?.injectMode;
   const reflectionInjectMode: ReflectionInjectMode =
@@ -3248,26 +3291,26 @@ export function parsePluginConfig(value: unknown): PluginConfig {
     sessionMemory:
       typeof cfg.sessionMemory === "object" && cfg.sessionMemory !== null
         ? {
-            enabled:
-              (cfg.sessionMemory as Record<string, unknown>).enabled === true,
-            messageCount:
-              typeof (cfg.sessionMemory as Record<string, unknown>)
-                .messageCount === "number"
-                ? ((cfg.sessionMemory as Record<string, unknown>)
-                    .messageCount as number)
-                : undefined,
-          }
+          enabled:
+            (cfg.sessionMemory as Record<string, unknown>).enabled === true,
+          messageCount:
+            typeof (cfg.sessionMemory as Record<string, unknown>)
+              .messageCount === "number"
+              ? ((cfg.sessionMemory as Record<string, unknown>)
+                .messageCount as number)
+              : undefined,
+        }
         : undefined,
     mdMirror:
       typeof cfg.mdMirror === "object" && cfg.mdMirror !== null
         ? {
-            enabled:
-              (cfg.mdMirror as Record<string, unknown>).enabled === true,
-            dir:
-              typeof (cfg.mdMirror as Record<string, unknown>).dir === "string"
-                ? ((cfg.mdMirror as Record<string, unknown>).dir as string)
-                : undefined,
-          }
+          enabled:
+            (cfg.mdMirror as Record<string, unknown>).enabled === true,
+          dir:
+            typeof (cfg.mdMirror as Record<string, unknown>).dir === "string"
+              ? ((cfg.mdMirror as Record<string, unknown>).dir as string)
+              : undefined,
+        }
         : undefined,
   };
 }

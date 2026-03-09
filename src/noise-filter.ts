@@ -27,6 +27,12 @@ const META_QUESTION_PATTERNS = [
   /如果不知道.+只回复\s*none/i,
   /只回复精确代号/i,
   /只回复\s*none/i,
+  // Chinese recall / meta-question patterns
+  /你还?记得/,
+  /记不记得/,
+  /还记得.*吗/,
+  /你[知晓]道.+吗/,
+  /我(?:之前|上次|以前)(?:说|提|讲).*(?:吗|呢|？|\?)/,
 ];
 
 // Session boilerplate
