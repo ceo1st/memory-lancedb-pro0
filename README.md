@@ -763,8 +763,10 @@ No config changes or data migration required. All existing memories, scopes, and
 
 ### OpenClaw version requirements
 
-- **Minimum:** OpenClaw 2026.3.12
-- **Recommended:** OpenClaw 2026.3.22+ (includes `before_prompt_build` typed hook support and plugin-entry subpath exports)
+- **Minimum:** OpenClaw 2026.3.22
+- **Recommended:** OpenClaw latest (2026.3.23+)
+
+This version uses `before_prompt_build` hooks (replacing the deprecated `before_agent_start`), which requires OpenClaw 2026.3.22 or later. Running `openclaw doctor --fix` after upgrading will automatically migrate plugin config (e.g. `minimax-portal-auth` → `minimax`, Brave search as a standalone plugin).
 
 To upgrade OpenClaw:
 
