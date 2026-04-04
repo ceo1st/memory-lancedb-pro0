@@ -1108,4 +1108,49 @@ export class MemoryStore {
       return { success: false, error: msg };
     }
   }
+
+  /**
+   * Fetch memories older than `maxTimestamp` including their raw vectors.
+   * Used exclusively by the memory compactor; vectors are intentionally
+   * omitted from `list()` for performance, but compaction needs them for
+   * cosine-similarity clustering.
+   */
+  async fetchForCompaction(
+    maxTimestamp: number,
+    scopeFilter?: string[],
+    limit = 200,
+  ): Promise<MemoryEntry[]> {
+    await this.ensureInitialized();
+
+    const conditions: string[] = [`timestamp < ${maxTimestamp}`];
+
+    if (scopeFilter && scopeFilter.length > 0) {
+      const scopeConditions = scopeFilter
+        .map((scope) => `scope = '${escapeSqlLiteral(scope)}'`)
+        .join(" OR ");
+      conditions.push(`((${scopeConditions}) OR scope IS NULL)`);
+    }
+
+    const whereClause = conditions.join(" AND ");
+
+    const results = await this.table!
+      .query()
+      .where(whereClause)
+      .toArray();
+
+    return results
+      .slice(0, limit)
+      .map(
+        (row): MemoryEntry => ({
+          id: row.id as string,
+          text: row.text as string,
+          vector: Array.isArray(row.vector) ? (row.vector as number[]) : [],
+          category: row.category as MemoryEntry["category"],
+          scope: (row.scope as string | undefined) ?? "global",
+          importance: Number(row.importance),
+          timestamp: Number(row.timestamp),
+          metadata: (row.metadata as string) || "{}",
+        }),
+      );
+  }
 }

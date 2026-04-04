@@ -49,6 +49,7 @@ import {
   type WorkspaceBoundaryConfig,
 } from "./workspace-boundary.js";
 import { inferAtomicBrandItemPreferenceSlot } from "./preference-slots.js";
+import { batchDedup } from "./batch-dedup.js";
 
 // ============================================================================
 // Envelope Metadata Stripping
@@ -69,8 +70,19 @@ import { inferAtomicBrandItemPreferenceSlot } from "./preference-slots.js";
  * - Standalone JSON blocks containing message_id/sender_id fields
  */
 export function stripEnvelopeMetadata(text: string): string {
-  // 1. Strip "System: [timestamp] Channel..." lines
+  // 0. Strip runtime orchestration wrappers that should never become memories
+  //    (sub-agent task scaffolding is execution metadata, not conversation content).
   let cleaned = text.replace(
+    /^\[(?:Subagent Context|Subagent Task)\]\s*(?:You are running as a subagent.*?(?:$|(?<=\.)\s+)|Results auto-announce to your requester\.?\s*|do not busy-poll for status\.?\s*|Reply with a brief acknowledgment only\.?\s*|Do not use any memory tools\.?\s*)?/gim,
+    "",
+  );
+  cleaned = cleaned.replace(
+    /^(?:Results auto-announce to your requester\.?|do not busy-poll for status\.?|Do not use any memory tools\.?)\s*$/gim,
+    "",
+  );
+
+  // 1. Strip "System: [timestamp] Channel..." lines
+  cleaned = cleaned.replace(
     /^System:\s*\[[\d\-: +GMT]+\]\s+\S+\[.*?\].*$/gm,
     "",
   );
@@ -220,8 +232,31 @@ export class SmartExtractor {
       `memory-pro: smart-extractor: extracted ${candidates.length} candidate(s)`,
     );
 
-    // Step 2: Process each candidate through dedup pipeline
-    for (const candidate of candidates.slice(0, MAX_MEMORIES_PER_EXTRACTION)) {
+    // Step 1b: Batch-internal dedup — embed candidate abstracts and remove near-duplicates
+    //          before expensive per-candidate LLM dedup calls (see src/batch-dedup.ts)
+    const capped = candidates.slice(0, MAX_MEMORIES_PER_EXTRACTION);
+    let survivingCandidates = capped;
+    try {
+      const abstracts = capped.map((c) => c.abstract);
+      const vectors = await Promise.all(
+        abstracts.map((a) => this.embedder.embed(a).catch(() => [] as number[])),
+      );
+      const dedupResult = batchDedup(abstracts, vectors);
+      if (dedupResult.duplicateIndices.length > 0) {
+        survivingCandidates = dedupResult.survivingIndices.map((i) => capped[i]);
+        stats.skipped += dedupResult.duplicateIndices.length;
+        this.log(
+          `memory-pro: smart-extractor: batchDedup dropped ${dedupResult.duplicateIndices.length} near-duplicate(s), ${survivingCandidates.length} survivor(s)`,
+        );
+      }
+    } catch (err) {
+      this.log(
+        `memory-pro: smart-extractor: batchDedup failed, proceeding without batch dedup: ${String(err)}`,
+      );
+    }
+
+    // Step 2: Process each surviving candidate through dedup pipeline
+    for (const candidate of survivingCandidates) {
       if (
         isUserMdExclusiveMemory(
           {
@@ -377,6 +412,13 @@ export class SmartExtractor {
     let shortAbstractCount = 0;
     let noiseAbstractCount = 0;
     for (const raw of result.memories) {
+      if (!raw || typeof raw !== "object") {
+        invalidCategoryCount++;
+        this.debugLog(
+          `memory-lancedb-pro: smart-extractor: dropping null/invalid candidate entry`,
+        );
+        continue;
+      }
       const category = normalizeCategory(raw.category ?? "");
       if (!category) {
         invalidCategoryCount++;
@@ -954,7 +996,7 @@ export class SmartExtractor {
             confidence: 0.7,
             source_session: sessionKey,
             source: "auto-capture",
-            state: "pending",
+            state: "confirmed", // #350: write confirmed to unblock auto-recall
             memory_layer: "working",
             injected_count: 0,
             bad_recall_count: 0,
@@ -1052,7 +1094,7 @@ export class SmartExtractor {
       last_accessed_at: Date.now(),
       source_session: sessionKey,
       source: "auto-capture" as const,
-      state: "pending" as const,
+      state: "confirmed" as const, // #350: write confirmed to unblock auto-recall
       memory_layer: "working" as const,
       injected_count: 0,
       bad_recall_count: 0,
@@ -1116,7 +1158,7 @@ export class SmartExtractor {
       last_accessed_at: Date.now(),
       source_session: sessionKey,
       source: "auto-capture" as const,
-      state: "pending" as const,
+      state: "confirmed" as const, // #350: write confirmed to unblock auto-recall
       memory_layer: "working" as const,
       injected_count: 0,
       bad_recall_count: 0,
@@ -1172,7 +1214,7 @@ export class SmartExtractor {
           confidence: 0.7,
           source_session: sessionKey,
           source: "auto-capture",
-          state: "pending",
+          state: "confirmed", // #350: write confirmed to unblock auto-recall
           memory_layer: "working",
           injected_count: 0,
           bad_recall_count: 0,
@@ -1289,4 +1331,59 @@ export class SmartExtractor {
       );
     }
   }
+}
+
+// ============================================================================
+// Extraction Rate Limiter (Feature 7: Adaptive Extraction Throttling)
+// ============================================================================
+
+const ONE_HOUR_MS = 60 * 60 * 1000;
+
+export interface ExtractionRateLimiterOptions {
+  /** Maximum number of extractions allowed per hour (default: 30) */
+  maxExtractionsPerHour?: number;
+}
+
+export interface ExtractionRateLimiter {
+  /** Check whether the current rate would exceed the limit */
+  isRateLimited(): boolean;
+  /** Record a new extraction timestamp */
+  recordExtraction(): void;
+  /** Get the number of extractions in the current window */
+  getRecentCount(): number;
+}
+
+/**
+ * Create an extraction rate limiter that tracks timestamps in a sliding
+ * one-hour window.
+ */
+export function createExtractionRateLimiter(
+  options: ExtractionRateLimiterOptions = {},
+): ExtractionRateLimiter {
+  const maxPerHour = options.maxExtractionsPerHour ?? 30;
+  const timestamps: number[] = [];
+
+  function pruneOld(): void {
+    const cutoff = Date.now() - ONE_HOUR_MS;
+    while (timestamps.length > 0 && timestamps[0] < cutoff) {
+      timestamps.shift();
+    }
+  }
+
+  return {
+    isRateLimited(): boolean {
+      pruneOld();
+      return timestamps.length >= maxPerHour;
+    },
+
+    recordExtraction(): void {
+      pruneOld();
+      timestamps.push(Date.now());
+    },
+
+    getRecentCount(): number {
+      pruneOld();
+      return timestamps.length;
+    },
+  };
 }

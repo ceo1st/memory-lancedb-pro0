@@ -11,14 +11,15 @@ import {
   parseAccessMetadata,
 } from "./access-tracker.js";
 import { filterNoise } from "./noise-filter.js";
+import { expandQuery } from "./query-expander.js";
 import type { DecayEngine, DecayableMemory } from "./decay-engine.js";
 import type { TierManager } from "./tier-manager.js";
 import {
   getDecayableFromEntry,
-  isMemoryActiveAt,
-  parseSmartMetadata,
   toLifecycleMemory,
 } from "./smart-metadata.js";
+import { TraceCollector, type RetrievalTrace } from "./retrieval-trace.js";
+import { RetrievalStatsCollector } from "./retrieval-stats.js";
 
 // ============================================================================
 // Types & Configuration
@@ -28,6 +29,8 @@ export interface RetrievalConfig {
   mode: "hybrid" | "vector";
   vectorWeight: number;
   bm25Weight: number;
+  /** Expand BM25 queries with high-signal synonyms for manual / CLI retrieval. */
+  queryExpansion: boolean;
   minScore: number;
   rerank: "cross-encoder" | "lightweight" | "none";
   candidatePoolSize: number;
@@ -56,6 +59,8 @@ export interface RetrievalConfig {
     | "pinecone"
     | "dashscope"
     | "tei";
+  /** Rerank API timeout in milliseconds (default: 5000). Increase for local/CPU-based rerank servers. */
+  rerankTimeoutMs?: number;
   /**
    * Length normalization: penalize long entries that dominate via sheer keyword
    * density. Formula: score *= 1 / (1 + log2(charLen / anchor)).
@@ -109,6 +114,62 @@ export interface RetrievalResult extends MemorySearchResult {
   };
 }
 
+export interface RetrievalDiagnostics {
+  source?: RetrievalContext["source"];
+  mode: RetrievalConfig["mode"];
+  originalQuery: string;
+  bm25Query: string | null;
+  queryExpanded: boolean;
+  limit: number;
+  scopeFilter?: string[];
+  category?: string;
+  vectorResultCount: number;
+  bm25ResultCount: number;
+  fusedResultCount: number;
+  finalResultCount: number;
+  stageCounts: {
+    afterMinScore: number;
+    rerankInput: number;
+    afterRerank: number;
+    afterRecency: number;
+    afterImportance: number;
+    afterLengthNorm: number;
+    afterTimeDecay: number;
+    afterHardMinScore: number;
+    afterNoiseFilter: number;
+    afterDiversity: number;
+  };
+  dropSummary: Array<{
+    stage:
+      | "minScore"
+      | "rerankWindow"
+      | "rerank"
+      | "recencyBoost"
+      | "importanceWeight"
+      | "lengthNorm"
+      | "timeDecay"
+      | "hardMinScore"
+      | "noiseFilter"
+      | "diversity"
+      | "limit";
+    before: number;
+    after: number;
+    dropped: number;
+  }>;
+  failureStage?:
+    | "vector.embedQuery"
+    | "vector.vectorSearch"
+    | "vector.postProcess"
+    | "hybrid.embedQuery"
+    | "hybrid.vectorSearch"
+    | "hybrid.bm25Search"
+    | "hybrid.parallelSearch"
+    | "hybrid.fuseResults"
+    | "hybrid.rerank"
+    | "hybrid.postProcess";
+  errorMessage?: string;
+}
+
 // ============================================================================
 // Default Configuration
 // ============================================================================
@@ -117,6 +178,7 @@ export const DEFAULT_RETRIEVAL_CONFIG: RetrievalConfig = {
   mode: "hybrid",
   vectorWeight: 0.7,
   bm25Weight: 0.3,
+  queryExpansion: true,
   minScore: 0.3,
   rerank: "cross-encoder",
   candidatePoolSize: 20,
@@ -125,6 +187,7 @@ export const DEFAULT_RETRIEVAL_CONFIG: RetrievalConfig = {
   filterNoise: true,
   rerankModel: "jina-reranker-v3",
   rerankEndpoint: "https://api.jina.ai/v1/rerank",
+  rerankTimeoutMs: 5000,
   lengthNormAnchor: 500,
   hardMinScore: 0.35,
   timeDecayHalfLifeDays: 60,
@@ -150,6 +213,116 @@ function clamp01(value: number, fallback: number): number {
 function clamp01WithFloor(value: number, floor: number): number {
   const safeFloor = clamp01(floor, 0);
   return Math.max(safeFloor, clamp01(value, safeFloor));
+}
+
+type TaggedRetrievalError = Error & {
+  retrievalFailureStage?: NonNullable<RetrievalDiagnostics["failureStage"]>;
+};
+
+function attachFailureStage(
+  error: unknown,
+  stage: NonNullable<RetrievalDiagnostics["failureStage"]>,
+): TaggedRetrievalError {
+  const tagged =
+    error instanceof Error ? (error as TaggedRetrievalError) : new Error(String(error));
+  tagged.retrievalFailureStage = stage;
+  return tagged;
+}
+
+function extractFailureStage(
+  error: unknown,
+): RetrievalDiagnostics["failureStage"] | undefined {
+  return error instanceof Error
+    ? (error as TaggedRetrievalError).retrievalFailureStage
+    : undefined;
+}
+
+function buildDropSummary(
+  diagnostics: RetrievalDiagnostics,
+): RetrievalDiagnostics["dropSummary"] {
+  const stageDrops = [
+    {
+      order: 0,
+      stage: "minScore" as const,
+      before:
+        diagnostics.mode === "vector"
+          ? diagnostics.vectorResultCount
+          : diagnostics.fusedResultCount,
+      after: diagnostics.stageCounts.afterMinScore,
+    },
+    {
+      order: 1,
+      stage: "rerankWindow" as const,
+      before: diagnostics.stageCounts.afterMinScore,
+      after: diagnostics.stageCounts.rerankInput,
+    },
+    {
+      order: 2,
+      stage: "rerank" as const,
+      before: diagnostics.stageCounts.rerankInput,
+      after: diagnostics.stageCounts.afterRerank,
+    },
+    {
+      order: 3,
+      stage: "recencyBoost" as const,
+      before: diagnostics.stageCounts.afterRerank,
+      after: diagnostics.stageCounts.afterRecency,
+    },
+    {
+      order: 4,
+      stage: "importanceWeight" as const,
+      before: diagnostics.stageCounts.afterRecency,
+      after: diagnostics.stageCounts.afterImportance,
+    },
+    {
+      order: 5,
+      stage: "lengthNorm" as const,
+      before: diagnostics.stageCounts.afterImportance,
+      after: diagnostics.stageCounts.afterLengthNorm,
+    },
+    {
+      order: 6,
+      stage: "hardMinScore" as const,
+      before: diagnostics.stageCounts.afterLengthNorm,
+      after: diagnostics.stageCounts.afterHardMinScore,
+    },
+    {
+      order: 7,
+      stage: "timeDecay" as const,
+      before: diagnostics.stageCounts.afterHardMinScore,
+      after: diagnostics.stageCounts.afterTimeDecay,
+    },
+    {
+      order: 8,
+      stage: "noiseFilter" as const,
+      before: diagnostics.stageCounts.afterTimeDecay,
+      after: diagnostics.stageCounts.afterNoiseFilter,
+    },
+    {
+      order: 9,
+      stage: "diversity" as const,
+      before: diagnostics.stageCounts.afterNoiseFilter,
+      after: diagnostics.stageCounts.afterDiversity,
+    },
+    {
+      order: 10,
+      stage: "limit" as const,
+      before: diagnostics.stageCounts.afterDiversity,
+      after: diagnostics.finalResultCount,
+    },
+  ];
+
+  return stageDrops
+    .map(({ order, stage, before, after }) => ({
+      order,
+      stage,
+      before,
+      after,
+      dropped: Math.max(0, before - after),
+    }))
+    .filter((drop) => drop.dropped > 0)
+    .sort((a, b) => b.dropped - a.dropped || a.order - b.order)
+    .map(({ order: _order, ...drop }) => drop);
 }
 
 // ============================================================================
@@ -358,7 +531,9 @@ function cosineSimilarity(a: number[], b: number[]): number {
 
 export class MemoryRetriever {
   private accessTracker: AccessTracker | null = null;
+  private lastDiagnostics: RetrievalDiagnostics | null = null;
   private tierManager: TierManager | null = null;
+  private _statsCollector: RetrievalStatsCollector | null = null;
 
   constructor(
     private store: MemoryStore,
@@ -371,50 +546,157 @@ export class MemoryRetriever {
     this.accessTracker = tracker;
   }
 
-  private filterActiveResults<T extends MemorySearchResult>(results: T[]): T[] {
-    return results.filter((result) =>
-      isMemoryActiveAt(parseSmartMetadata(result.entry.metadata, result.entry)),
-    );
+  /** Enable aggregate retrieval statistics collection. */
+  setStatsCollector(collector: RetrievalStatsCollector): void {
+    this._statsCollector = collector;
+  }
+
+  /** Get the stats collector (if set). */
+  getStatsCollector(): RetrievalStatsCollector | null {
+    return this._statsCollector;
   }
 
   async retrieve(context: RetrievalContext): Promise<RetrievalResult[]> {
     const { query, limit, scopeFilter, category, source } = context;
     const safeLimit = clampInt(limit, 1, 20);
+    this.lastDiagnostics = null;
+    const diagnostics: RetrievalDiagnostics = {
+      source,
+      mode: this.config.mode,
+      originalQuery: query,
+      bm25Query: this.config.mode === "vector" ? null : query,
+      queryExpanded: false,
+      limit: safeLimit,
+      scopeFilter: scopeFilter ? [...scopeFilter] : undefined,
+      category,
+      vectorResultCount: 0,
+      bm25ResultCount: 0,
+      fusedResultCount: 0,
+      finalResultCount: 0,
+      stageCounts: {
+        afterMinScore: 0,
+        rerankInput: 0,
+        afterRerank: 0,
+        afterRecency: 0,
+        afterImportance: 0,
+        afterLengthNorm: 0,
+        afterTimeDecay: 0,
+        afterHardMinScore: 0,
+        afterNoiseFilter: 0,
+        afterDiversity: 0,
+      },
+      dropSummary: [],
+    };
 
-    // Check if query contains tag prefixes -> use BM25-only + mustContain
+    try {
+      // Create trace only when stats collector is active (zero overhead otherwise)
+      const trace = this._statsCollector ? new TraceCollector() : undefined;
+
+      // Check if query contains tag prefixes -> use BM25-only + mustContain
+      const tagTokens = this.extractTagTokens(query);
+      let results: RetrievalResult[];
+      if (tagTokens.length > 0) {
+        results = await this.bm25OnlyRetrieval(
+          query,
+          tagTokens,
+          safeLimit,
+          scopeFilter,
+          category,
+          trace,
+          diagnostics,
+        );
+      } else if (this.config.mode === "vector" || !this.store.hasFtsSupport) {
+        results = await this.vectorOnlyRetrieval(
+          query,
+          safeLimit,
+          scopeFilter,
+          category,
+          trace,
+          diagnostics,
+        );
+      } else {
+        results = await this.hybridRetrieval(
+          query,
+          safeLimit,
+          scopeFilter,
+          category,
+          trace,
+          source,
+          diagnostics,
+        );
+      }
+
+      diagnostics.finalResultCount = results.length;
+      diagnostics.dropSummary = buildDropSummary(diagnostics);
+      this.lastDiagnostics = diagnostics;
+
+      if (trace && this._statsCollector) {
+        const mode = tagTokens.length > 0
+          ? "bm25"
+          : (this.config.mode === "vector" || !this.store.hasFtsSupport)
+            ? "vector"
+            : "hybrid";
+        const finalTrace = trace.finalize(query, mode);
+        this._statsCollector.recordQuery(finalTrace, source || "unknown");
+      }
+
+      // Record access for reinforcement (manual recall only)
+      if (this.accessTracker && source === "manual" && results.length > 0) {
+        this.accessTracker.recordAccess(results.map((r) => r.entry.id));
+      }
+
+      return results;
+    } catch (error) {
+      diagnostics.finalResultCount = 0;
+      diagnostics.dropSummary = buildDropSummary(diagnostics);
+      diagnostics.errorMessage =
+        error instanceof Error ? error.message : String(error);
+      this.lastDiagnostics = diagnostics;
+      throw error;
+    }
+  }
+
+  /**
+   * Retrieve with full trace, used by the memory_debug tool.
+   * Always collects a trace regardless of stats collector state.
+   */
+  async retrieveWithTrace(
+    context: RetrievalContext,
+  ): Promise<{ results: RetrievalResult[]; trace: RetrievalTrace }> {
+    const { query, limit, scopeFilter, category, source } = context;
+    const safeLimit = clampInt(limit, 1, 20);
+    const trace = new TraceCollector();
+
     const tagTokens = this.extractTagTokens(query);
     let results: RetrievalResult[];
-    
+
     if (tagTokens.length > 0) {
       results = await this.bm25OnlyRetrieval(
-        query,
-        tagTokens,
-        safeLimit,
-        scopeFilter,
-        category,
+        query, tagTokens, safeLimit, scopeFilter, category, trace,
       );
     } else if (this.config.mode === "vector" || !this.store.hasFtsSupport) {
       results = await this.vectorOnlyRetrieval(
-        query,
-        safeLimit,
-        scopeFilter,
-        category,
+        query, safeLimit, scopeFilter, category, trace,
       );
     } else {
       results = await this.hybridRetrieval(
-        query,
-        safeLimit,
-        scopeFilter,
-        category,
+        query, safeLimit, scopeFilter, category, trace,
       );
     }
 
-    // Record access for reinforcement (manual recall only)
+    const mode = tagTokens.length > 0 ? "bm25"
+      : (this.config.mode === "vector" || !this.store.hasFtsSupport) ? "vector" : "hybrid";
+    const finalTrace = trace.finalize(query, mode);
+
+    if (this._statsCollector) {
+      this._statsCollector.recordQuery(finalTrace, source || "debug");
+    }
+
     if (this.accessTracker && source === "manual" && results.length > 0) {
       this.accessTracker.recordAccess(results.map((r) => r.entry.id));
     }
 
-    return results;
+    return { results, trace: finalTrace };
   }
 
   private extractTagTokens(query: string): string[] {
@@ -431,45 +713,73 @@ export class MemoryRetriever {
     limit: number,
     scopeFilter?: string[],
     category?: string,
+    trace?: TraceCollector,
+    diagnostics?: RetrievalDiagnostics,
   ): Promise<RetrievalResult[]> {
-    const queryVector = await this.embedder.embedQuery(query);
-    const results = await this.store.vectorSearch(
-      queryVector,
-      limit,
-      this.config.minScore,
-      scopeFilter,
-      { excludeInactive: true },
-    );
+    let failureStage: RetrievalDiagnostics["failureStage"] = "vector.embedQuery";
+    try {
+      const queryVector = await this.embedder.embedQuery(query);
+      failureStage = "vector.vectorSearch";
+      const results = await this.store.vectorSearch(
+        queryVector,
+        limit,
+        this.config.minScore,
+        scopeFilter,
+        { excludeInactive: true },
+      );
 
-    // Filter by category if specified
-    const filtered = category
-      ? results.filter((r) => r.entry.category === category)
-      : results;
+      const filtered = category
+        ? results.filter((r) => r.entry.category === category)
+        : results;
+      if (diagnostics) {
+        diagnostics.vectorResultCount = filtered.length;
+        diagnostics.fusedResultCount = filtered.length;
+        diagnostics.stageCounts.afterMinScore = filtered.length;
+        diagnostics.stageCounts.rerankInput = filtered.length;
+      }
 
-    const mapped = filtered.map(
-      (result, index) =>
-        ({
-          ...result,
-          sources: {
-            vector: { score: result.score, rank: index + 1 },
-          },
-        }) as RetrievalResult,
-    );
+      const mapped = filtered.map(
+        (result, index) =>
+          ({
+            ...result,
+            sources: {
+              vector: { score: result.score, rank: index + 1 },
+            },
+          }) as RetrievalResult,
+      );
 
-    const weighted = this.decayEngine ? mapped : this.applyImportanceWeight(this.applyRecencyBoost(mapped));
-    const lengthNormalized = this.applyLengthNormalization(weighted);
-    const hardFiltered = lengthNormalized.filter(r => r.score >= this.config.hardMinScore);
-    const lifecycleRanked = this.decayEngine
-      ? this.applyDecayBoost(hardFiltered)
-      : this.applyTimeDecay(hardFiltered);
-    const denoised = this.config.filterNoise
-      ? filterNoise(lifecycleRanked, r => r.entry.text)
-      : lifecycleRanked;
+      failureStage = "vector.postProcess";
+      const recencyBoosted = this.applyRecencyBoost(mapped);
+      if (diagnostics) diagnostics.stageCounts.afterRecency = recencyBoosted.length;
+      const weighted = this.decayEngine
+        ? recencyBoosted
+        : this.applyImportanceWeight(recencyBoosted);
+      if (diagnostics) diagnostics.stageCounts.afterImportance = weighted.length;
+      const lengthNormalized = this.applyLengthNormalization(weighted);
+      if (diagnostics) diagnostics.stageCounts.afterLengthNorm = lengthNormalized.length;
+      const hardFiltered = lengthNormalized.filter((r) => r.score >= this.config.hardMinScore);
+      if (diagnostics) diagnostics.stageCounts.afterHardMinScore = hardFiltered.length;
+      const timeOrDecayRanked = this.decayEngine
+        ? this.applyDecayBoost(hardFiltered)
+        : this.applyTimeDecay(hardFiltered);
+      if (diagnostics) diagnostics.stageCounts.afterTimeDecay = timeOrDecayRanked.length;
+      const denoised = this.config.filterNoise
+        ? filterNoise(timeOrDecayRanked, (r) => r.entry.text)
+        : timeOrDecayRanked;
+      if (diagnostics) diagnostics.stageCounts.afterNoiseFilter = denoised.length;
+      const deduplicated = this.applyMMRDiversity(denoised);
+      if (diagnostics) {
+        diagnostics.stageCounts.afterRerank = mapped.length;
+        diagnostics.stageCounts.afterDiversity = deduplicated.length;
+      }
 
-    // MMR deduplication: avoid top-k filled with near-identical memories
-    const deduplicated = this.applyMMRDiversity(denoised);
-
-    return deduplicated.slice(0, limit);
+      return deduplicated.slice(0, limit);
+    } catch (error) {
+      if (diagnostics) {
+        diagnostics.failureStage = extractFailureStage(error) ?? failureStage;
+      }
+      throw error;
+    }
   }
 
   private async bm25OnlyRetrieval(
@@ -478,56 +788,96 @@ export class MemoryRetriever {
     limit: number,
     scopeFilter?: string[],
     category?: string,
+    trace?: TraceCollector,
+    diagnostics?: RetrievalDiagnostics,
   ): Promise<RetrievalResult[]> {
     const candidatePoolSize = Math.max(this.config.candidatePoolSize, limit * 2);
-    
-    // Run BM25 search
+
+    trace?.startStage("bm25_search", []);
     const bm25Results = await this.store.bm25Search(
       query,
       candidatePoolSize,
       scopeFilter,
       { excludeInactive: true },
     );
-
-    // Filter by category if specified
     const categoryFiltered = category
       ? bm25Results.filter((r) => r.entry.category === category)
       : bm25Results;
-
-    // mustContain: only keep entries that literally contain all tag tokens (case-insensitive)
     const mustContainFiltered = categoryFiltered.filter((r) => {
       const textLower = r.entry.text.toLowerCase();
       return tagTokens.every((t) => textLower.includes(t.toLowerCase()));
     });
-
     const mapped = mustContainFiltered.map(
       (result, index) =>
         ({
           ...result,
-          sources: {
-            bm25: { score: result.score, rank: index + 1 },
-          },
+          sources: { bm25: { score: result.score, rank: index + 1 } },
         }) as RetrievalResult,
     );
+    trace?.endStage(mapped.map((r) => r.entry.id), mapped.map((r) => r.score));
+    if (diagnostics) {
+      diagnostics.bm25Query = query;
+      diagnostics.bm25ResultCount = mapped.length;
+      diagnostics.fusedResultCount = mapped.length;
+      diagnostics.stageCounts.afterMinScore = mapped.length;
+      diagnostics.stageCounts.rerankInput = mapped.length;
+      diagnostics.stageCounts.afterRerank = mapped.length;
+    }
 
-    // Apply same post-processing as hybrid retrieval to avoid behavior regression
-    const temporallyRanked = this.decayEngine
-      ? mapped
-      : this.applyImportanceWeight(this.applyRecencyBoost(mapped));
+    let temporallyRanked: RetrievalResult[];
+    if (this.decayEngine) {
+      temporallyRanked = mapped;
+      if (diagnostics) {
+        diagnostics.stageCounts.afterRecency = mapped.length;
+        diagnostics.stageCounts.afterImportance = mapped.length;
+      }
+    } else {
+      trace?.startStage("recency_boost", mapped.map((r) => r.entry.id));
+      const boosted = this.applyRecencyBoost(mapped);
+      trace?.endStage(boosted.map((r) => r.entry.id), boosted.map((r) => r.score));
+      if (diagnostics) diagnostics.stageCounts.afterRecency = boosted.length;
 
+      trace?.startStage("importance_weight", boosted.map((r) => r.entry.id));
+      temporallyRanked = this.applyImportanceWeight(boosted);
+      trace?.endStage(
+        temporallyRanked.map((r) => r.entry.id),
+        temporallyRanked.map((r) => r.score),
+      );
+      if (diagnostics) diagnostics.stageCounts.afterImportance = temporallyRanked.length;
+    }
+
+    trace?.startStage("length_normalization", temporallyRanked.map((r) => r.entry.id));
     const lengthNormalized = this.applyLengthNormalization(temporallyRanked);
-    const hardFiltered = lengthNormalized.filter(r => r.score >= this.config.hardMinScore);
+    trace?.endStage(lengthNormalized.map((r) => r.entry.id), lengthNormalized.map((r) => r.score));
+    if (diagnostics) diagnostics.stageCounts.afterLengthNorm = lengthNormalized.length;
 
+    trace?.startStage("hard_cutoff", lengthNormalized.map((r) => r.entry.id));
+    const hardFiltered = lengthNormalized.filter((r) => r.score >= this.config.hardMinScore);
+    trace?.endStage(hardFiltered.map((r) => r.entry.id), hardFiltered.map((r) => r.score));
+    if (diagnostics) diagnostics.stageCounts.afterHardMinScore = hardFiltered.length;
+
+    const decayStageName = this.decayEngine ? "decay_boost" : "time_decay";
+    trace?.startStage(decayStageName, hardFiltered.map((r) => r.entry.id));
     const lifecycleRanked = this.decayEngine
       ? this.applyDecayBoost(hardFiltered)
       : this.applyTimeDecay(hardFiltered);
+    trace?.endStage(lifecycleRanked.map((r) => r.entry.id), lifecycleRanked.map((r) => r.score));
+    if (diagnostics) diagnostics.stageCounts.afterTimeDecay = lifecycleRanked.length;
 
+    trace?.startStage("noise_filter", lifecycleRanked.map((r) => r.entry.id));
     const denoised = this.config.filterNoise
-      ? filterNoise(lifecycleRanked, r => r.entry.text)
+      ? filterNoise(lifecycleRanked, (r) => r.entry.text)
       : lifecycleRanked;
+    trace?.endStage(denoised.map((r) => r.entry.id), denoised.map((r) => r.score));
+    if (diagnostics) diagnostics.stageCounts.afterNoiseFilter = denoised.length;
 
+    trace?.startStage("mmr_diversity", denoised.map((r) => r.entry.id));
     const deduplicated = this.applyMMRDiversity(denoised);
-    return deduplicated.slice(0, limit);
+    const finalResults = deduplicated.slice(0, limit);
+    trace?.endStage(finalResults.map((r) => r.entry.id), finalResults.map((r) => r.score));
+    if (diagnostics) diagnostics.stageCounts.afterDiversity = deduplicated.length;
+
+    return finalResults;
   }
 
   private async hybridRetrieval(
@@ -535,70 +885,151 @@ export class MemoryRetriever {
     limit: number,
     scopeFilter?: string[],
     category?: string,
+    trace?: TraceCollector,
+    source?: RetrievalContext["source"],
+    diagnostics?: RetrievalDiagnostics,
   ): Promise<RetrievalResult[]> {
-    const candidatePoolSize = Math.max(
-      this.config.candidatePoolSize,
-      limit * 2,
-    );
+    let failureStage: RetrievalDiagnostics["failureStage"] = "hybrid.embedQuery";
+    try {
+      const candidatePoolSize = Math.max(this.config.candidatePoolSize, limit * 2);
+      const queryVector = await this.embedder.embedQuery(query);
+      const bm25Query = this.buildBM25Query(query, source);
+      if (diagnostics) {
+        diagnostics.bm25Query = bm25Query;
+        diagnostics.queryExpanded = bm25Query !== query;
+      }
 
-    // Compute query embedding once, reuse for vector search + reranking
-    const queryVector = await this.embedder.embedQuery(query);
-
-    // Run vector and BM25 searches in parallel
-    const [vectorResults, bm25Results] = await Promise.all([
-      this.runVectorSearch(
-        queryVector,
-        candidatePoolSize,
-        scopeFilter,
-        category,
-      ),
-      this.runBM25Search(query, candidatePoolSize, scopeFilter, category),
-    ]);
-
-    // Fuse results using RRF (async: validates BM25-only entries exist in store)
-    const fusedResults = await this.fuseResults(vectorResults, bm25Results);
-
-    // Apply minimum score threshold
-    const filtered = fusedResults.filter(
-      (r) => r.score >= this.config.minScore,
-    );
-
-    // Rerank if enabled
-    const reranked =
-      this.config.rerank !== "none"
-        ? await this.rerankResults(
-          query,
+      trace?.startStage("parallel_search", []);
+      failureStage = "hybrid.parallelSearch";
+      const [vectorResults, bm25Results] = await Promise.all([
+        this.runVectorSearch(
           queryVector,
-          filtered.slice(0, limit * 2),
-        )
-        : filtered;
+          candidatePoolSize,
+          scopeFilter,
+          category,
+        ).catch((error) => {
+          throw attachFailureStage(error, "hybrid.vectorSearch");
+        }),
+        this.runBM25Search(
+          bm25Query,
+          candidatePoolSize,
+          scopeFilter,
+          category,
+        ).catch((error) => {
+          throw attachFailureStage(error, "hybrid.bm25Search");
+        }),
+      ]);
+      if (diagnostics) {
+        diagnostics.vectorResultCount = vectorResults.length;
+        diagnostics.bm25ResultCount = bm25Results.length;
+      }
+      if (trace) {
+        const allSearchIds = [
+          ...new Set([
+            ...vectorResults.map((r) => r.entry.id),
+            ...bm25Results.map((r) => r.entry.id),
+          ]),
+        ];
+        const allScores = [
+          ...vectorResults.map((r) => r.score),
+          ...bm25Results.map((r) => r.score),
+        ];
+        trace.endStage(allSearchIds, allScores);
+      }
 
-    const temporallyRanked = this.decayEngine
-      ? reranked
-      : this.applyImportanceWeight(this.applyRecencyBoost(reranked));
+      failureStage = "hybrid.fuseResults";
+      const allInputIds = [
+        ...new Set([
+          ...vectorResults.map((r) => r.entry.id),
+          ...bm25Results.map((r) => r.entry.id),
+        ]),
+      ];
+      trace?.startStage("rrf_fusion", allInputIds);
+      const fusedResults = await this.fuseResults(vectorResults, bm25Results);
+      trace?.endStage(fusedResults.map((r) => r.entry.id), fusedResults.map((r) => r.score));
+      if (diagnostics) diagnostics.fusedResultCount = fusedResults.length;
 
-    // Apply length normalization (penalize long entries dominating via keyword density)
-    const lengthNormalized = this.applyLengthNormalization(temporallyRanked);
+      trace?.startStage("min_score_filter", fusedResults.map((r) => r.entry.id));
+      const filtered = fusedResults.filter((r) => r.score >= this.config.minScore);
+      trace?.endStage(filtered.map((r) => r.entry.id), filtered.map((r) => r.score));
+      if (diagnostics) diagnostics.stageCounts.afterMinScore = filtered.length;
 
-    // Hard minimum score cutoff should be based on semantic / lexical relevance.
-    // Lifecycle decay and time-decay are used for re-ranking, not for dropping
-    // otherwise relevant fresh memories.
-    const hardFiltered = lengthNormalized.filter(r => r.score >= this.config.hardMinScore);
+      const rerankInput =
+        this.config.rerank !== "none" ? filtered.slice(0, limit * 2) : filtered;
+      if (diagnostics) diagnostics.stageCounts.rerankInput = rerankInput.length;
 
-    // Apply lifecycle-aware decay or legacy time decay after thresholding
-    const lifecycleRanked = this.decayEngine
-      ? this.applyDecayBoost(hardFiltered)
-      : this.applyTimeDecay(hardFiltered);
+      let reranked: RetrievalResult[];
+      failureStage = "hybrid.rerank";
+      if (this.config.rerank !== "none") {
+        trace?.startStage("rerank", filtered.map((r) => r.entry.id));
+        reranked = await this.rerankResults(query, queryVector, rerankInput);
+        trace?.endStage(reranked.map((r) => r.entry.id), reranked.map((r) => r.score));
+      } else {
+        reranked = filtered;
+      }
+      if (diagnostics) diagnostics.stageCounts.afterRerank = reranked.length;
 
-    // Filter noise
-    const denoised = this.config.filterNoise
-      ? filterNoise(lifecycleRanked, r => r.entry.text)
-      : lifecycleRanked;
+      let temporallyRanked: RetrievalResult[];
+      failureStage = "hybrid.postProcess";
+      if (this.decayEngine) {
+        temporallyRanked = reranked;
+        if (diagnostics) {
+          diagnostics.stageCounts.afterRecency = reranked.length;
+          diagnostics.stageCounts.afterImportance = reranked.length;
+        }
+      } else {
+        trace?.startStage("recency_boost", reranked.map((r) => r.entry.id));
+        const boosted = this.applyRecencyBoost(reranked);
+        trace?.endStage(boosted.map((r) => r.entry.id), boosted.map((r) => r.score));
+        if (diagnostics) diagnostics.stageCounts.afterRecency = boosted.length;
 
-    // MMR deduplication: avoid top-k filled with near-identical memories
-    const deduplicated = this.applyMMRDiversity(denoised);
+        trace?.startStage("importance_weight", boosted.map((r) => r.entry.id));
+        temporallyRanked = this.applyImportanceWeight(boosted);
+        trace?.endStage(
+          temporallyRanked.map((r) => r.entry.id),
+          temporallyRanked.map((r) => r.score),
+        );
+        if (diagnostics) diagnostics.stageCounts.afterImportance = temporallyRanked.length;
+      }
 
-    return deduplicated.slice(0, limit);
+      trace?.startStage("length_normalization", temporallyRanked.map((r) => r.entry.id));
+      const lengthNormalized = this.applyLengthNormalization(temporallyRanked);
+      trace?.endStage(lengthNormalized.map((r) => r.entry.id), lengthNormalized.map((r) => r.score));
+      if (diagnostics) diagnostics.stageCounts.afterLengthNorm = lengthNormalized.length;
+
+      trace?.startStage("hard_cutoff", lengthNormalized.map((r) => r.entry.id));
+      const hardFiltered = lengthNormalized.filter((r) => r.score >= this.config.hardMinScore);
+      trace?.endStage(hardFiltered.map((r) => r.entry.id), hardFiltered.map((r) => r.score));
+      if (diagnostics) diagnostics.stageCounts.afterHardMinScore = hardFiltered.length;
+
+      const decayStageName = this.decayEngine ? "decay_boost" : "time_decay";
+      trace?.startStage(decayStageName, hardFiltered.map((r) => r.entry.id));
+      const lifecycleRanked = this.decayEngine
+        ? this.applyDecayBoost(hardFiltered)
+        : this.applyTimeDecay(hardFiltered);
+      trace?.endStage(lifecycleRanked.map((r) => r.entry.id), lifecycleRanked.map((r) => r.score));
+      if (diagnostics) diagnostics.stageCounts.afterTimeDecay = lifecycleRanked.length;
+
+      trace?.startStage("noise_filter", lifecycleRanked.map((r) => r.entry.id));
+      const denoised = this.config.filterNoise
+        ? filterNoise(lifecycleRanked, (r) => r.entry.text)
+        : lifecycleRanked;
+      trace?.endStage(denoised.map((r) => r.entry.id), denoised.map((r) => r.score));
+      if (diagnostics) diagnostics.stageCounts.afterNoiseFilter = denoised.length;
+
+      trace?.startStage("mmr_diversity", denoised.map((r) => r.entry.id));
+      const deduplicated = this.applyMMRDiversity(denoised);
+      const finalResults = deduplicated.slice(0, limit);
+      trace?.endStage(finalResults.map((r) => r.entry.id), finalResults.map((r) => r.score));
+      if (diagnostics) diagnostics.stageCounts.afterDiversity = deduplicated.length;
+
+      return finalResults;
+    } catch (error) {
+      if (diagnostics) {
+        diagnostics.failureStage = extractFailureStage(error) ?? failureStage;
+      }
+      throw error;
+    }
   }
 
   private async runVectorSearch(
@@ -643,6 +1074,15 @@ export class MemoryRetriever {
       ...result,
       rank: index + 1,
     }));
+  }
+
+  private buildBM25Query(
+    query: string,
+    source?: RetrievalContext["source"],
+  ): string {
+    if (!this.config.queryExpansion) return query;
+    if (source !== "manual" && source !== "cli") return query;
+    return expandQuery(query);
   }
 
   private async fuseResults(
@@ -738,9 +1178,11 @@ export class MemoryRetriever {
     }
 
     // Try cross-encoder rerank via configured provider API
-    if (this.config.rerank === "cross-encoder" && this.config.rerankApiKey) {
+    const provider = this.config.rerankProvider || "jina";
+    const hasApiKey = !!this.config.rerankApiKey;
+
+    if (this.config.rerank === "cross-encoder" && hasApiKey) {
       try {
-        const provider = this.config.rerankProvider || "jina";
         const model = this.config.rerankModel || "jina-reranker-v3";
         const endpoint =
           this.config.rerankEndpoint || "https://api.jina.ai/v1/rerank";
@@ -749,25 +1191,28 @@ export class MemoryRetriever {
         // Build provider-specific request
         const { headers, body } = buildRerankRequest(
           provider,
-          this.config.rerankApiKey,
+          this.config.rerankApiKey || "",
           model,
           query,
           documents,
           results.length,
         );
 
-        // Timeout: 5 seconds to prevent stalling retrieval pipeline
+        // Timeout: configurable via rerankTimeoutMs (default: 5000ms)
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 5000);
+        const timeout = setTimeout(() => controller.abort(), this.config.rerankTimeoutMs ?? 5000);
 
-        const response = await fetch(endpoint, {
-          method: "POST",
-          headers,
-          body: JSON.stringify(body),
-          signal: controller.signal,
-        });
-
-        clearTimeout(timeout);
+        let response: Response;
+        try {
+          response = await fetch(endpoint, {
+            method: "POST",
+            headers,
+            body: JSON.stringify(body),
+            signal: controller.signal,
+          });
+        } finally {
+          clearTimeout(timeout);
+        }
 
         if (response.ok) {
           const data: unknown = await response.json();
@@ -826,7 +1271,7 @@ export class MemoryRetriever {
         }
       } catch (error) {
         if (error instanceof Error && error.name === "AbortError") {
-          console.warn("Rerank API timed out (5s), falling back to cosine");
+          console.warn(`Rerank API timed out (${this.config.rerankTimeoutMs ?? 5000}ms), falling back to cosine`);
         } else {
           console.warn("Rerank API failed, falling back to cosine:", error);
         }
@@ -1141,6 +1586,20 @@ export class MemoryRetriever {
   // Get current configuration
   getConfig(): RetrievalConfig {
     return { ...this.config };
+  }
+
+  getLastDiagnostics(): RetrievalDiagnostics | null {
+    if (!this.lastDiagnostics) return null;
+    return {
+      ...this.lastDiagnostics,
+      scopeFilter: this.lastDiagnostics.scopeFilter
+        ? [...this.lastDiagnostics.scopeFilter]
+        : undefined,
+      stageCounts: { ...this.lastDiagnostics.stageCounts },
+      dropSummary: this.lastDiagnostics.dropSummary.map((drop) => ({
+        ...drop,
+      })),
+    };
   }
 
   // Test retrieval system
